@@ -589,12 +589,14 @@ pub fn finish_sign_in_with_progress(
 impl Secrets {
     fn new(refresh_token: String, mc: Minecraft) -> Self {
         Self {
+            ely_oauth: false,
             refresh_token,
             sign_in_required: false,
             minecraft_token: mc.token,
             minecraft_expires_at: mc.expires_at,
             xuid: mc.xuid,
             owns: true,
+            ely: false,
         }
     }
 }
@@ -2423,22 +2425,24 @@ impl SignIn {
                 let flow = ely::oauth::BrowserFlow::new(config)?;
                 *thread_state.lock().unwrap() =
                     SignInState::Browser(flow.authorization_url(expected.as_ref()));
-                let (code, verifier) = flow.wait_for_code(&thread_cancel)?;
-                let profile = flow.exchange_code(&code, &verifier, &thread_cancel)?;
-                let store = store();
-                let _operation = session::lock(store)?;
-                let (account, secrets) = profile;
-                let mut accounts = Accounts::load();
-                accept_sign_in(
-                    &mut accounts,
-                    store,
-                    expected.as_ref(),
-                    account.clone(),
-                    &secrets,
+                flow.finish(
                     &|| thread_cancel.load(Ordering::Relaxed),
-                    &|_| {},
-                )?;
-                Ok(account)
+                    |account, secrets| {
+                        let store = store();
+                        let _operation = session::lock(store)?;
+                        let mut accounts = Accounts::load();
+                        accept_sign_in(
+                            &mut accounts,
+                            store,
+                            expected.as_ref(),
+                            account.clone(),
+                            &secrets,
+                            &|| thread_cancel.load(Ordering::Relaxed),
+                            &|_| {},
+                        )?;
+                        Ok(account)
+                    },
+                )
             })();
             *thread_state.lock().unwrap() = SignInState::Done(result);
         });

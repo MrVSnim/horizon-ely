@@ -881,6 +881,18 @@ impl Launcher {
             _ if !configured => div().child(tr(account::NOT_CONFIGURED)),
             Some(SignInState::Starting) => div().child(tr("Asking Microsoft…")),
             Some(SignInState::Working(phase)) => div().child(tr(phase.label())),
+            Some(SignInState::Browser(url)) => {
+                let url = url.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(tr("Complete sign-in in your browser…"))
+                    .child(
+                        button("open-browser", tr("Open browser"), Kind::Secondary, &t)
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    )
+            }
             Some(SignInState::Code(code)) => div()
                 .flex()
                 .flex_col()

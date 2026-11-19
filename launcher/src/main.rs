@@ -413,6 +413,7 @@ struct Launcher {
     /// developer options (`dev_options`) for this run.
     dev_clicks: u8,
     dev_options: bool,
+    ely: ely_page::ElyUi,
     /// Horizon-free: the name the game made up for an offline player (`horizon-player.txt`), for
     /// the top bar.
     offline_name: Option<String>,
