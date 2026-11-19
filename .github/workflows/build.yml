@@ -1,0 +1,124 @@
+name: Build and Release Elyhorizon
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish to GitHub Releases'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  HORIZON_TELEMETRY_URL: 'off'
+  # Desktop application ID for Ely.by OAuth (PKCE, public client)
+  HORIZON_ELY_CLIENT_ID: ${{ vars.HORIZON_ELY_CLIENT_ID }}
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Horizon Launcher
+        run: cargo build --manifest-path launcher/Cargo.toml --release --bin horizon-launcher
+
+      - name: Build Horizon Client (Rust Game Engine)
+        run: cargo build --release -p horizon-client --bin horizon-client
+
+      - name: Package Windows Bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist\bundle -Force | Out-Null
+          Copy-Item launcher\target\release\horizon-launcher.exe dist\bundle\
+          Copy-Item target\release\horizon-client.exe dist\bundle\
+          Copy-Item LICENSE, README.md dist\bundle\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path dist\bundle\* -DestinationPath dist\horizon-ely-windows-x64.zip -Force
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist\horizon-ely-windows-x64.zip
+
+  build-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libvulkan-dev libwayland-dev libxkbcommon-dev libx11-dev libx11-xcb-dev libfontconfig1-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Horizon Launcher
+        run: cargo build --manifest-path launcher/Cargo.toml --release --bin horizon-launcher
+
+      - name: Build Horizon Client
+        run: cargo build --release -p horizon-client --bin horizon-client
+
+      - name: Package Linux Bundle
+        run: |
+          mkdir -p dist/bundle
+          cp launcher/target/release/horizon-launcher dist/bundle/
+          cp target/release/horizon-client dist/bundle/
+          cp LICENSE README.md dist/bundle/ || true
+          tar -czvf dist/horizon-ely-linux-x86_64.tar.gz -C dist/bundle .
+
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/horizon-ely-linux-x86_64.tar.gz
+
+  release:
+    needs: [build-windows, build-linux]
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Calculate Checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" == "main" || -z "$TAG" ]]; then
+            TAG="v$(date +'%Y.%m.%d')-ely"
+          fi
+          gh release create "$TAG" release-assets/* \
+            --title "Horizon Ely ($TAG)" \
+            --notes "Automatic build of Horizon with Ely.by skin system and account integration." \
+            --latest

@@ -12,6 +12,7 @@
 //!
 //! The Azure app (client ID) is Horizon's own and is configuration: `HORIZON_MSA_CLIENT_ID` at
 //! build time, or at run time to override it. Without one, sign-in says it is not configured.
+pub mod ely;
 pub mod session;
 
 use serde_json::{json, Value};
@@ -470,14 +471,30 @@ fn owns_game(ep: &Endpoints, token: &str) -> Result<bool, String> {
 /// A Minecraft profile, as the launcher shows and remembers it (no secrets).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Account {
-    /// The profile UUID without dashes.
+    /// The profile UUID without dashes, or `ely:<uuid>`.
     pub uuid: String,
     pub name: String,
-    /// The active skin's URL (textures.minecraft.net) and model ("classic" or "slim").
+    /// The active skin's URL and model ("classic" or "slim").
     #[serde(default)]
     pub skin: Option<(String, String)>,
     #[serde(default)]
     pub cape: Option<String>,
+}
+
+impl Account {
+    pub fn is_ely(&self) -> bool {
+        self.uuid.starts_with("ely:")
+    }
+    pub fn profile_uuid(&self) -> &str {
+        self.uuid.strip_prefix("ely:").unwrap_or(&self.uuid)
+    }
+    pub fn provider_label(&self) -> &'static str {
+        if self.is_ely() {
+            "Ely.by account"
+        } else {
+            "Microsoft account"
+        }
+    }
 }
 
 /// The profile; none when the account has none (it doesn't own the game, or never made one).
@@ -523,18 +540,22 @@ fn profile(ep: &Endpoints, token: &str) -> Result<Option<Account>, String> {
 /// What the keychain keeps for one account.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Secrets {
-    refresh_token: String,
     #[serde(default)]
-    sign_in_required: bool,
-    minecraft_token: String,
-    minecraft_expires_at: u64,
+    pub ely_oauth: bool,
+    pub refresh_token: String,
     #[serde(default)]
-    xuid: Option<String>,
+    pub sign_in_required: bool,
+    pub minecraft_token: String,
+    pub minecraft_expires_at: u64,
+    #[serde(default)]
+    pub xuid: Option<String>,
     /// The last answer the Minecraft services gave: whether the account owns the game. It is
     /// kept here, beside the tokens, so that no plain file can say yes. Accounts saved before it
     /// existed passed the same check at sign-in, which refuses everyone else.
     #[serde(default = "owned_at_sign_in")]
-    owns: bool,
+    pub owns: bool,
+    #[serde(default)]
+    pub ely: bool,
 }
 fn owned_at_sign_in() -> bool {
     true
@@ -2245,9 +2266,9 @@ pub fn write_session_file(
     let mut file = options.open(&path).map_err(|e| e.to_string())?;
     let body = json!({
         "name": account.name,
-        "uuid": account.uuid,
+        "uuid": account.profile_uuid(),
         "access_token": secrets.minecraft_token,
-        "user_type": "msa",
+        "user_type": if account.is_ely() { "elyby" } else { "msa" },
         "xuid": secrets.xuid,
     });
     std::io::Write::write_all(&mut file, body.to_string().as_bytes()).map_err(|e| e.to_string())?;
@@ -2336,8 +2357,9 @@ fn accept_sign_in(
     }
     if let Some(expected) = expected {
         if expected.uuid != account.uuid {
+            let provider = expected.provider_label();
             return Err(format!(
-                "Signed in as {} instead of {}. Use the Microsoft account for {} and try again.",
+                "Signed in as {} instead of {}. Use the {provider} for {} and try again.",
                 account.name, expected.name, expected.name
             ));
         }
@@ -2360,6 +2382,8 @@ pub enum SignInState {
     Starting,
     /// Waiting for the player at `verification_uri` with `user_code`.
     Code(DeviceCode),
+    /// Ely.by authorization URL; opens in browser.
+    Browser(String),
     Working(session::Phase),
     Done(Result<Account, String>),
 }
@@ -2377,7 +2401,51 @@ impl SignIn {
 
     /// Restore this exact Minecraft identity without changing who currently plays.
     pub fn start_for(account: Account) -> Self {
-        Self::start_expected(Some(account))
+        if account.is_ely() {
+            Self::start_ely(Some(account))
+        } else {
+            Self::start_expected(Some(account))
+        }
+    }
+
+    pub fn start_ely(expected: Option<Account>) -> Self {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_cancel = cancel.clone();
+        let state = Arc::new(Mutex::new(SignInState::Starting));
+        let thread_state = state.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let config = ely::oauth::Config::load()?;
+                let flow = ely::oauth::BrowserFlow::new(config)?;
+                *thread_state.lock().unwrap() =
+                    SignInState::Browser(flow.authorization_url(expected.as_ref()));
+                let (code, verifier) = flow.wait_for_code(&thread_cancel)?;
+                let profile = flow.exchange_code(&code, &verifier, &thread_cancel)?;
+                let store = store();
+                let _operation = session::lock(store)?;
+                let (account, secrets) = profile;
+                let mut accounts = Accounts::load();
+                accept_sign_in(
+                    &mut accounts,
+                    store,
+                    expected.as_ref(),
+                    account.clone(),
+                    &secrets,
+                    &|| thread_cancel.load(Ordering::Relaxed),
+                    &|_| {},
+                )?;
+                Ok(account)
+            })();
+            *thread_state.lock().unwrap() = SignInState::Done(result);
+        });
+        SignIn {
+            state,
+            cancel,
+        }
     }
 
     fn start_expected(expected: Option<Account>) -> Self {

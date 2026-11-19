@@ -41,6 +41,18 @@ pub const TEXTURE_URIS: [&str; 2] = [
 pub fn texture_uris() -> &'static [String] {
     static URIS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     URIS.get_or_init(|| {
+        if crate::auth::using_ely() {
+            return vec![
+                "https://textures.ely.by/".into(),
+                "http://textures.ely.by/".into(),
+                "https://ely.by/storage/".into(),
+                "http://ely.by/storage/".into(),
+                "https://skinsystem.ely.by/".into(),
+                "http://skinsystem.ely.by/".into(),
+                "https://textures.minecraft.net/texture/{textureId}".into(),
+                "http://textures.minecraft.net/texture/{textureId}".into(),
+            ];
+        }
         crate::auth::discovery_overridden()
             .then(|| crate::auth::discovery().ok())
             .flatten()

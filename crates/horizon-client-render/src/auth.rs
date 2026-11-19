@@ -14,12 +14,13 @@ pub const DEFAULT_DISCOVERY: &str = "https://discovery.minecraftservices.com/min
 /// A session file older than this is refused: it can't be replayed later.
 const MAX_SESSION_FILE_AGE: Duration = Duration::from_secs(120);
 
-/// A signed-in account (vanilla's User with type msa).
+/// A signed-in account (vanilla's User with type msa or elyby).
 pub struct AuthSession {
     pub name: String,
     pub uuid: u128,
     pub xuid: Option<String>,
     access_token: String,
+    pub ely: bool,
 }
 impl std::fmt::Debug for AuthSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,6 +41,10 @@ pub fn parse_uuid(text: &str) -> Option<u128> {
 }
 
 impl AuthSession {
+    pub fn is_ely(&self) -> bool {
+        self.ely
+    }
+
     /// For tests and harnesses.
     pub fn new(name: &str, uuid: u128, access_token: &str) -> Self {
         Self {
@@ -47,13 +52,14 @@ impl AuthSession {
             uuid,
             xuid: None,
             access_token: access_token.to_owned(),
+            ely: false,
         }
     }
 
     pub fn access_token(&self) -> &str {
         &self.access_token
     }
-    /// The session file's JSON: {"name", "uuid", "access_token", "user_type": "msa", "xuid"}.
+    /// The session file's JSON: {"name", "uuid", "access_token", "user_type": "msa"|"elyby", "xuid"}.
     pub fn parse(text: &str) -> Result<Self, String> {
         let v: serde_json::Value =
             serde_json::from_str(text).map_err(|_| "the session is not valid JSON")?;
@@ -68,14 +74,15 @@ impl AuthSession {
         let access_token = field("access_token")
             .filter(|t| !t.is_empty())
             .ok_or("the session has no access token")?;
-        if field("user_type").is_some_and(|t| t != "msa") {
-            return Err("the session is not a Microsoft account session".into());
+        if field("user_type").is_some_and(|t| t != "msa" && t != "elyby") {
+            return Err("the session uses an unsupported account provider".into());
         }
         Ok(Self {
             name: name.to_owned(),
             uuid,
             xuid: field("xuid").map(str::to_owned),
             access_token: access_token.to_owned(),
+            ely: field("user_type") == Some("elyby"),
         })
     }
     /// Read the session file the launcher wrote and delete it at once. It
@@ -203,8 +210,51 @@ pub fn discovery_overridden() -> bool {
     discovery_url() != DEFAULT_DISCOVERY
 }
 
+/// A server or session must opt into Ely explicitly.
+pub fn using_ely() -> bool {
+    current().map_or_else(
+        || std::env::var("HORIZON_AUTH_PROVIDER").is_ok_and(|v| v == "elyby"),
+        |s| s.ely,
+    )
+}
+
+pub fn ely_discovery() -> serde_json::Value {
+    serde_json::json!({"discovery": {
+        "session": {"endpoints": {
+            "join": {"uri": "https://authserver.ely.by/session/join"},
+            "verify": {"uri": "https://authserver.ely.by/session/hasJoined"},
+            "getProfileById": {"uri": "https://authserver.ely.by/session/profile/{profileId}"}
+        }},
+        "profiles": {
+            "endpoints": {
+                "getTexture": {
+                    "uri": "https://authserver.ely.by/session/profile/{profileId}",
+                    "validUris": [
+                        "https://textures.ely.by/",
+                        "http://textures.ely.by/",
+                        "https://ely.by/storage/",
+                        "http://ely.by/storage/",
+                        "https://skinsystem.ely.by/",
+                        "http://skinsystem.ely.by/",
+                        "https://textures.minecraft.net/texture/{textureId}",
+                        "http://textures.minecraft.net/texture/{textureId}"
+                    ]
+                },
+                "getByName": {"uri": "https://authserver.ely.by/api/users/profiles/minecraft/{name}"}
+            }
+        }
+    }})
+}
+
 /// The discovery document, fetched once per game (a failure is retried next time).
 pub(crate) fn discovery() -> Result<Arc<serde_json::Value>, JoinError> {
+    if using_ely() {
+        return Ok(Arc::new(ely_discovery()));
+    }
+    microsoft_discovery()
+}
+
+fn microsoft_discovery() -> Result<Arc<serde_json::Value>, JoinError> {
     static CACHE: Mutex<Option<Arc<serde_json::Value>>> = Mutex::new(None);
     if let Some(d) = CACHE.lock().unwrap().clone() {
         return Ok(d);
@@ -235,6 +285,9 @@ pub fn endpoint(doc: &serde_json::Value, service: &str, name: &str) -> Option<St
 /// attributes call falls back to the offline properties, a failed profile call
 /// to no actions, as vanilla does. Blocks: call it off the main thread.
 pub fn fetch_account_status(session: &AuthSession) -> crate::ban_notice::AccountStatus {
+    if session.ely {
+        return crate::ban_notice::AccountStatus::default();
+    }
     use crate::ban_notice::{AccountStatus, parse_profile_actions, parse_properties};
     let Ok(doc) = discovery() else {
         return AccountStatus::default();

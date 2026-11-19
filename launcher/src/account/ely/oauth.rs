@@ -1,0 +1,1123 @@
+//! Ely.by authorization-code flow. Browser credentials never enter the launcher.
+//! Public Desktop applications use S256 PKCE; no application secret is loaded or sent.
+use super::*;
+use base64::Engine;
+use sha2::{Digest, Sha256};
+use std::io::{BufRead, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::time::Instant;
+use url::Url;
+
+const SCOPE: &str = "account_info offline_access minecraft_server_session";
+pub const NOT_CONFIGURED: &str = "This build has no Ely.by Desktop application ID. Install a release configured with HORIZON_ELY_CLIENT_ID.";
+const DEFAULT_REDIRECT: &str = "http://127.0.0.1:38467/oauth/ely";
+const APPLICATION_KEY: &str = "ely-oauth-application";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Application {
+    client_id: String,
+    #[serde(default = "default_redirect")]
+    redirect_uri: String,
+}
+
+fn default_redirect() -> String {
+    DEFAULT_REDIRECT.into()
+}
+
+pub struct Config {
+    client_id: String,
+    redirect: Url,
+    token_url: String,
+    info_url: String,
+}
+
+impl Config {
+    pub fn load() -> Result<Self, String> {
+        Self::load_with(
+            store(),
+            &|key| std::env::var(key).ok(),
+            option_env!("HORIZON_ELY_CLIENT_ID"),
+        )
+    }
+
+    fn load_with(
+        secrets: &dyn SecretStore,
+        environment: &dyn Fn(&str) -> Option<String>,
+        bundled_id: Option<&str>,
+    ) -> Result<Self, String> {
+        let field = |key| environment(key).filter(|s| !s.trim().is_empty());
+        let id = field("HORIZON_ELY_CLIENT_ID");
+        let id = id.or_else(|| {
+            bundled_id
+                .map(str::to_owned)
+                .filter(|s| !s.trim().is_empty())
+        });
+        // Release builds never need a developer's keychain configuration.
+        let saved: Option<Application> = if id.is_some() {
+            None
+        } else {
+            secrets
+                .get(APPLICATION_KEY)?
+                .map(|value| {
+                    serde_json::from_str(&value)
+                        .map_err(|_| crate::i18n::tr(NOT_CONFIGURED).to_owned())
+                })
+                .transpose()?
+        };
+        let client_id = id
+            .or_else(|| saved.as_ref().map(|a| a.client_id.clone()))
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| crate::i18n::tr(NOT_CONFIGURED).to_owned())?;
+        let redirect = field("HORIZON_ELY_REDIRECT_URI")
+            .or_else(|| saved.as_ref().map(|a| a.redirect_uri.clone()))
+            .unwrap_or_else(default_redirect);
+        Ok(Self {
+            client_id,
+            redirect: parse_redirect(&redirect)?,
+            token_url: "https://account.ely.by/api/oauth2/v1/token".into(),
+            info_url: "https://account.ely.by/api/account/v1/info".into(),
+        })
+    }
+}
+
+/// Optional development override; releases carry only their public Desktop client ID.
+/// The historical keychain record's client_secret field is ignored, never used.
+pub fn configure(input: &str) -> Result<String, String> {
+    configure_with(store(), input)
+}
+
+fn configure_with(secrets: &dyn SecretStore, input: &str) -> Result<String, String> {
+    let invalid = || crate::i18n::tr(NOT_CONFIGURED).to_owned();
+    let application: Application = serde_json::from_str(input).map_err(|_| invalid())?;
+    if application.client_id.trim().is_empty()
+        || serde_json::from_str::<Value>(input)
+            .ok()
+            .is_some_and(|v| v.get("client_secret").is_some())
+    {
+        return Err(invalid());
+    }
+    parse_redirect(&application.redirect_uri)?;
+    if !secrets.persistent() {
+        return Err(crate::i18n::tr(super::super::NO_KEYCHAIN).to_owned());
+    }
+    secrets.set(
+        APPLICATION_KEY,
+        &serde_json::to_string(&application).map_err(|_| invalid())?,
+    )?;
+    Ok(application.client_id)
+}
+
+fn parse_redirect(value: &str) -> Result<Url, String> {
+    let invalid = || {
+        crate::i18n::tr("Ely.by redirect URI must be an HTTP address on 127.0.0.1 with an explicit port and callback path.").to_owned()
+    };
+    let url = Url::parse(value).map_err(|_| invalid())?;
+    if url.scheme() != "http"
+        || url.host_str() != Some("127.0.0.1")
+        || url.port().is_none_or(|port| port == 0)
+        || url.path() == "/"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
+fn challenge(verifier: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+fn new_verifier() -> Result<String, String> {
+    let mut bytes = [0; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| crate::i18n::tr("Could not create a secure sign-in."))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub struct BrowserFlow {
+    config: Config,
+    listener: TcpListener,
+    state: String,
+    verifier: String,
+}
+
+impl BrowserFlow {
+    pub fn new(mut config: Config) -> Result<Self, String> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|_| crate::i18n::tr("Could not start Ely.by browser sign-in."))?;
+        config
+            .redirect
+            .set_port(Some(
+                listener
+                    .local_addr()
+                    .map_err(|_| crate::i18n::tr("Could not start Ely.by browser sign-in."))?
+                    .port(),
+            ))
+            .expect("loopback URL");
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| crate::i18n::tr("Could not start Ely.by browser sign-in."))?;
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes)
+            .map_err(|_| crate::i18n::tr("Could not create a secure sign-in."))?;
+        Ok(Self {
+            config,
+            listener,
+            state: bytes.iter().map(|b| format!("{b:02x}")).collect(),
+            verifier: new_verifier()?,
+        })
+    }
+
+    pub fn authorization_url(&self, expected: Option<&Account>) -> String {
+        let mut url = Url::parse("https://account.ely.by/oauth2/v1").expect("constant URL");
+        url.query_pairs_mut()
+            .append_pair("client_id", &self.config.client_id)
+            .append_pair("redirect_uri", self.config.redirect.as_str())
+            .append_pair("response_type", "code")
+            .append_pair("code_challenge", &challenge(&self.verifier))
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("scope", SCOPE)
+            .append_pair("state", &self.state)
+            .append_pair("prompt", "select_account");
+        if let Some(account) = expected {
+            url.query_pairs_mut()
+                .append_pair("login_hint", &account.name);
+        }
+        url.into()
+    }
+
+    pub fn finish(
+        self,
+        cancelled: &dyn Fn() -> bool,
+        save: impl FnOnce(Account, Secrets) -> Result<Account, String>,
+    ) -> Result<Account, String> {
+        self.complete_callback(cancelled, Duration::from_secs(300), |pair| {
+            let (account, secrets) = with_textures(AUTH_SERVER, pair);
+            save(account, secrets)
+        })
+    }
+
+    fn complete_callback<T>(
+        &self,
+        cancelled: &dyn Fn() -> bool,
+        timeout: Duration,
+        save: impl FnOnce((Account, Secrets)) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let (code, mut browser) = self.wait_code(cancelled, timeout)?;
+        if cancelled() {
+            reply(&mut browser, 200, "Sign-in cancelled.");
+            return Err(crate::i18n::tr("Sign-in cancelled.").into());
+        }
+        let result = self.exchange_code(&code).and_then(save);
+        match &result {
+            Ok(_) => reply(
+                &mut browser,
+                200,
+                "Login successful! Returning to Elyhorizon...",
+            ),
+            Err(_) => reply(
+                &mut browser,
+                502,
+                "Sign-in could not be completed. Return to Elyhorizon for details.",
+            ),
+        }
+        result
+    }
+
+    fn exchange_code(&self, code: &str) -> Result<(Account, Secrets), String> {
+        let (status, value) = token_request(
+            &self.config,
+            vec![
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("code_verifier", &self.verifier),
+                ("redirect_uri", self.config.redirect.as_str()),
+            ],
+        )?;
+        let secrets = tokens(status, &value, None)?;
+        let account = profile(&self.config, &secrets.minecraft_token)?;
+        Ok((account, secrets))
+    }
+
+    fn wait_code(
+        &self,
+        cancelled: &dyn Fn() -> bool,
+        timeout: Duration,
+    ) -> Result<(String, TcpStream), String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if cancelled() {
+                return Err(crate::i18n::tr("Sign-in cancelled.").into());
+            }
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
+                    let result = callback(&mut stream, &self.config.redirect, &self.state);
+                    match result {
+                        Callback::Code(code) => {
+                            return Ok((code, stream));
+                        }
+                        Callback::Denied => {
+                            reply(
+                                &mut stream,
+                                200,
+                                "Ely.by sign-in was declined in the browser.",
+                            );
+                            return Err(crate::i18n::tr(
+                                "Ely.by sign-in was declined in the browser.",
+                            )
+                            .into());
+                        }
+                        Callback::Ignore => reply(
+                            &mut stream,
+                            400,
+                            "Invalid Ely.by callback. Return to Elyhorizon and try again.",
+                        ),
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                Err(_) => {
+                    return Err(
+                        crate::i18n::tr("Could not receive the Ely.by browser response.").into(),
+                    )
+                }
+            }
+        }
+        Err(crate::i18n::tr("Ely.by browser sign-in timed out. Try again.").into())
+    }
+}
+
+enum Callback {
+    Code(String),
+    Denied,
+    Ignore,
+}
+
+fn callback_headers(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    stream.set_nonblocking(true).ok()?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut headers = Vec::new();
+    let result = loop {
+        if Instant::now() >= deadline || headers.len() >= 8192 {
+            break None;
+        }
+        let mut bytes = [0u8; 1024];
+        match stream.read(&mut bytes) {
+            Ok(0) => break None,
+            Ok(n) => {
+                headers.extend_from_slice(&bytes[..n]);
+                if headers.len() > 8192 {
+                    break None;
+                }
+                if headers.windows(4).any(|s| s == b"\r\n\r\n") {
+                    break Some(headers);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            Err(_) => break None,
+        }
+    };
+    let _ = stream.set_nonblocking(false);
+    result
+}
+
+fn callback(stream: &mut TcpStream, redirect: &Url, state: &str) -> Callback {
+    // A per-read socket timeout alone permits a local slowloris to extend the
+    // five-minute flow deadline indefinitely. Bound the entire HTTP header read.
+    let Some(headers) = callback_headers(stream) else {
+        return Callback::Ignore;
+    };
+    let mut reader = std::io::BufReader::new(headers.as_slice());
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return Callback::Ignore;
+    }
+    let mut parts = line.split_whitespace();
+    if parts.next() != Some("GET") {
+        return Callback::Ignore;
+    }
+    let Some(target) = parts
+        .next()
+        .filter(|s| s.starts_with('/') && !s.starts_with("//"))
+    else {
+        return Callback::Ignore;
+    };
+    let target = target.to_owned();
+    if !matches!(parts.next(), Some("HTTP/1.1" | "HTTP/1.0")) || parts.next().is_some() {
+        return Callback::Ignore;
+    }
+    let mut hosts = Vec::new();
+    loop {
+        let mut header = String::new();
+        if reader
+            .read_line(&mut header)
+            .ok()
+            .filter(|n| *n > 0)
+            .is_none()
+        {
+            return Callback::Ignore;
+        }
+        if header == "\r\n" {
+            break;
+        }
+        let Some((name, value)) = header.split_once(':') else {
+            return Callback::Ignore;
+        };
+        if name.eq_ignore_ascii_case("host") {
+            hosts.push(value.trim().to_owned());
+        }
+    }
+    if hosts != [format!("127.0.0.1:{}", redirect.port().unwrap_or(80))] {
+        return Callback::Ignore;
+    }
+    let Ok(url) = redirect.join(&target) else {
+        return Callback::Ignore;
+    };
+    if url.origin() != redirect.origin() || url.path() != redirect.path() {
+        return Callback::Ignore;
+    }
+    let pairs: Vec<_> = url.query_pairs().collect();
+    let only = |name: &str| {
+        let mut values = pairs
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_ref());
+        let first = values.next()?;
+        if values.next().is_some() {
+            None
+        } else {
+            Some(first)
+        }
+    };
+    if ["state", "iss", "code", "error"]
+        .iter()
+        .any(|name| pairs.iter().filter(|(key, _)| key == name).count() > 1)
+        || (only("code").is_some() && only("error").is_some())
+        || url.fragment().is_some()
+    {
+        return Callback::Ignore;
+    }
+    if only("state") != Some(state) || only("iss") != Some("https://account.ely.by") {
+        return Callback::Ignore;
+    }
+    if only("error").is_some() {
+        return Callback::Denied;
+    }
+    match only("code").filter(|s| !s.is_empty() && s.len() <= 4096) {
+        Some(code) => Callback::Code(code.to_owned()),
+        None => Callback::Ignore,
+    }
+}
+
+fn reply(stream: &mut TcpStream, status: u16, message: &str) {
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let body = crate::i18n::tr(message);
+    let _ = write!(stream, "HTTP/1.1 {status} Response\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'\r\nConnection: close\r\n\r\n{body}", body.len());
+}
+
+fn token_request<'a>(
+    config: &'a Config,
+    mut fields: Vec<(&'a str, &'a str)>,
+) -> Result<(u16, Value), String> {
+    fields.push(("client_id", &config.client_id));
+
+    oauth_send(
+        oauth_request("POST", &config.token_url),
+        Some(Body::Form(fields)),
+        "Ely.by token exchange",
+    )
+}
+
+// Keep provider bodies and transport URLs private: either can echo a bearer token/code.
+fn oauth_send(
+    request: ureq::Request,
+    body: Option<Body>,
+    operation: &str,
+) -> Result<(u16, Value), String> {
+    let result = match body {
+        Some(Body::Form(fields)) => request.send_form(&fields),
+        Some(Body::Json(value)) => request.send_json(value),
+        None => {
+            let endpoint = request.url().to_owned();
+            crate::network::retry_request(&endpoint, || request.clone().call().map_err(Box::new))
+                .map_err(|error| *error)
+        }
+    };
+    let response = match result {
+        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+        Err(ureq::Error::Transport(error)) => {
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+            let mut timeout = false;
+            while let Some(error) = source {
+                timeout |= error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                    matches!(
+                        io.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    )
+                });
+                source = error.source();
+            }
+            return Err(crate::i18n::trf(
+                if timeout {
+                    "{operation} timed out. Try again."
+                } else {
+                    "{operation} could not connect. Check your network and proxy settings."
+                },
+                &[("operation", crate::i18n::tr(operation))],
+            ));
+        }
+    };
+    let status = response.status();
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(65537)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            crate::i18n::trf(
+                "{operation} response was interrupted. Try again.",
+                &[("operation", crate::i18n::tr(operation))],
+            )
+        })?;
+    if bytes.len() > 65536 {
+        return Err(crate::i18n::trf(
+            "{operation} returned an oversized response.",
+            &[("operation", crate::i18n::tr(operation))],
+        ));
+    }
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if status != 200 {
+        eprintln!(
+            "{}",
+            crate::i18n::trf(
+                "{operation} returned HTTP {status}.",
+                &[
+                    ("operation", crate::i18n::tr(operation)),
+                    ("status", &status.to_string())
+                ]
+            )
+        );
+    }
+    Ok((status, value))
+}
+
+// Authorization codes, verifiers and bearer tokens must never follow HTTP redirects.
+fn oauth_request(method: &str, url: &str) -> ureq::Request {
+    crate::proxy::agent(
+        ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout(Duration::from_secs(20)),
+        url,
+    )
+    .build()
+    .request(method, url)
+}
+
+/// Public diagnostics for checking an installed release with an empty environment.
+pub fn status() -> Result<Value, String> {
+    let config = Config::load()?;
+    Ok(
+        json!({"client_id": config.client_id, "bundled_client_id": option_env!("HORIZON_ELY_CLIENT_ID"), "flow": "authorization_code_pkce", "code_challenge_method": "S256", "client_secret_required": false}),
+    )
+}
+
+fn tokens(status: u16, value: &Value, previous: Option<&Secrets>) -> Result<Secrets, String> {
+    if status != 200 {
+        if value.get("error").and_then(Value::as_str) == Some("invalid_client") {
+            return Err(crate::i18n::tr("Ely.by rejected this application. The release must use a registered public Desktop application ID, not a Website application.").into());
+        }
+        if matches!(status, 400 | 401 | 403) {
+            return Err(crate::i18n::tr(EXPIRED).into());
+        }
+        return Err(crate::i18n::trf(
+            "Ely.by token exchange returned HTTP {status}. Try again later.",
+            &[("status", &status.to_string())],
+        ));
+    }
+    let malformed =
+        || crate::i18n::tr("Could not read the Ely.by browser sign-in response.").to_owned();
+    let access = str_field(value, "access_token")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(malformed)?;
+    if str_field(value, "token_type").is_some_and(|s| !s.eq_ignore_ascii_case("bearer")) {
+        return Err(malformed());
+    }
+    let refresh = str_field(value, "refresh_token")
+        .filter(|s| !s.is_empty())
+        .or_else(|| previous.map(|s| s.refresh_token.clone()))
+        .ok_or_else(malformed)?;
+    let seconds = value
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .filter(|s| *s >= -1)
+        // Ely's newer server can issue non-expiring sessions with a nonpositive
+        // advertised lifetime. Never extend trust locally: renew before play.
+        .map(|s| s.max(0) as u64)
+        .ok_or_else(malformed)?;
+    Ok(Secrets {
+        ely: true,
+        ely_oauth: true,
+        refresh_token: refresh,
+        sign_in_required: false,
+        minecraft_token: access,
+        minecraft_expires_at: now().saturating_add(seconds),
+        xuid: None,
+        owns: false,
+    })
+}
+
+fn profile(config: &Config, token: &str) -> Result<Account, String> {
+    let (status, value) = oauth_send(
+        bearer(oauth_request("GET", &config.info_url), token),
+        None,
+        "Ely.by profile request",
+    )?;
+    if status == 401 || status == 403 {
+        return Err(crate::i18n::tr(EXPIRED).into());
+    }
+    let invalid = || {
+        crate::i18n::tr(
+            "Ely.by profile response did not contain a valid UUID and Minecraft player name.",
+        )
+        .to_owned()
+    };
+    if status != 200 {
+        return Err(crate::i18n::trf(
+            "Ely.by profile request returned HTTP {status}. Try again later.",
+            &[("status", &status.to_string())],
+        ));
+    }
+    let uuid = str_field(&value, "uuid")
+        .ok_or_else(invalid)?
+        .replace('-', "")
+        .to_lowercase();
+    let name = str_field(&value, "username").ok_or_else(invalid)?;
+    if uuid.len() != 32
+        || !uuid.bytes().all(|b| b.is_ascii_hexdigit())
+        || !(1..=16).contains(&name.len())
+        || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        return Err(invalid());
+    }
+    Ok(Account {
+        uuid: format!("ely:{uuid}"),
+        name,
+        skin: None,
+        cape: None,
+    })
+}
+
+pub(super) fn refresh(account: &Account, mut secrets: Secrets) -> Check {
+    if secrets.sign_in_required {
+        return Check::NoAnswer(crate::i18n::tr(EXPIRED).into(), secrets);
+    }
+    let result = (|| {
+        let config = Config::load()?;
+        let (status, value) = token_request(
+            &config,
+            vec![
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &secrets.refresh_token),
+                ("scope", SCOPE),
+            ],
+        )?;
+        let renewed = tokens(status, &value, Some(&secrets))?;
+        // Save rotation before a later profile request can fail.
+        secrets = renewed;
+        let profile = profile(&config, &secrets.minecraft_token)?;
+        if profile.uuid != account.uuid {
+            return Err(crate::i18n::tr(EXPIRED).to_owned());
+        }
+        Ok(profile)
+    })();
+    match result {
+        Ok(profile) => {
+            let (profile, secrets) = with_textures(AUTH_SERVER, (profile, secrets));
+            Check::Owns(profile, secrets)
+        }
+        Err(e) => {
+            secrets.sign_in_required = e == crate::i18n::tr(EXPIRED);
+            Check::NoAnswer(e, secrets)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    type Requests = Vec<(String, String, String)>;
+
+    #[derive(Default)]
+    struct AppStore(MemoryStore);
+    impl SecretStore for AppStore {
+        fn get(&self, key: &str) -> Result<Option<String>, String> {
+            self.0.get(key)
+        }
+        fn set(&self, key: &str, value: &str) -> Result<(), String> {
+            self.0.set(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<(), String> {
+            self.0.delete(key)
+        }
+        fn persistent(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn release_configuration_needs_only_a_bundled_public_id_and_no_keychain() {
+        let store = MemoryStore::default();
+        assert!(Config::load_with(&store, &|_| None, None).is_err());
+        assert!(Config::load_with(&store, &|_| None, Some("  ")).is_err());
+        let config = Config::load_with(&store, &|_| None, Some("release-desktop-app")).unwrap();
+        assert_eq!(config.client_id, "release-desktop-app");
+        let config = Config::load_with(
+            &store,
+            &|key| (key == "HORIZON_ELY_CLIENT_SECRET").then(|| "must-be-ignored".into()),
+            Some("release-desktop-app"),
+        )
+        .unwrap();
+        assert_eq!(config.client_id, "release-desktop-app");
+        assert!(store.get(APPLICATION_KEY).unwrap().is_none());
+        store
+            .set(APPLICATION_KEY, "damaged legacy application record")
+            .unwrap();
+        assert_eq!(
+            Config::load_with(&store, &|_| None, Some("release-desktop-app"))
+                .unwrap()
+                .client_id,
+            "release-desktop-app"
+        );
+    }
+
+    #[test]
+    fn pkce_uses_the_rfc7636_s256_vector_and_independent_random_values() {
+        assert_eq!(
+            challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+        let a = BrowserFlow::new(config()).unwrap();
+        let b = BrowserFlow::new(config()).unwrap();
+        assert_ne!(a.verifier, b.verifier);
+        assert_ne!(a.state, b.state);
+        assert_ne!(a.verifier, a.state);
+        assert_eq!(a.verifier.len(), 43);
+        assert_ne!(a.config.redirect.port(), b.config.redirect.port());
+    }
+
+    #[test]
+    fn application_configuration_survives_reloads_separately_from_player_accounts() {
+        let store = AppStore::default();
+        let input = r#"{"client_id":"registered-app"}"#;
+        assert_eq!(configure_with(&store, input).unwrap(), "registered-app");
+        let loaded = Config::load_with(&store, &|_| None, None).unwrap();
+        assert_eq!(loaded.client_id, "registered-app");
+        assert_eq!(loaded.redirect.as_str(), "http://127.0.0.1:38467/oauth/ely");
+        assert!(Accounts::default().accounts.is_empty());
+        assert!(!serde_json::to_string(&Accounts::default())
+            .unwrap()
+            .contains("stored-secret"));
+        let overridden = Config::load_with(
+            &store,
+            &|key| match key {
+                "HORIZON_ELY_CLIENT_ID" => Some("override-app".into()),
+                _ => None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(overridden.client_id, "override-app");
+        assert!(configure_with(
+            &store,
+            r#"{"client_id":"app","client_secret":"must-not-be-saved"}"#
+        )
+        .is_err());
+        assert!(configure_with(&MemoryStore::default(), input).is_err());
+        assert!(!configure_with(&store, "invalid JSON with private-data")
+            .unwrap_err()
+            .contains("private-data"));
+    }
+
+    fn api(responses: Vec<(u16, Value)>) -> (Config, std::thread::JoinHandle<Requests>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut config = config();
+        config.token_url = format!("{base}/token");
+        config.info_url = format!("{base}/info");
+        let thread = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, value) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.split_whitespace().nth(1).unwrap().to_owned();
+                let (mut length, mut authorization) = (0, String::new());
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                        if name.eq_ignore_ascii_case("authorization") {
+                            authorization = value.trim().to_owned();
+                        }
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                requests.push((path, String::from_utf8(body).unwrap(), authorization));
+                drop(reader);
+                let body = value.to_string();
+                write!(stream, "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        (config, thread)
+    }
+
+    #[test]
+    fn authorization_code_is_exchanged_without_an_app_secret_then_loads_the_public_profile() {
+        let (config, server) = api(vec![
+            (
+                200,
+                json!({"access_token":"new-access","refresh_token":"refresh-token","expires_in":86400,"token_type":"Bearer"}),
+            ),
+            (
+                200,
+                json!({"uuid":"ffc8fdc9-5824-509e-8a57-c99b940fb996","username":"ElyPlayer"}),
+            ),
+        ]);
+        let flow = BrowserFlow::new(config).unwrap();
+        let verifier = flow.verifier.clone();
+        let redirect = flow.config.redirect.to_string();
+        let (account, secrets) = flow.exchange_code("one-use-code").unwrap();
+        assert_eq!(secrets.minecraft_token, "new-access");
+        assert_eq!(secrets.refresh_token, "refresh-token");
+        let requests = server.join().unwrap();
+        let form: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(requests[0].1.as_bytes()).collect();
+        assert_eq!(requests[0].0, "/token");
+        assert_eq!(form.get("client_id").unwrap(), "test-app");
+        assert!(!form.contains_key("client_secret"));
+        assert_eq!(form.get("code_verifier").unwrap(), &verifier);
+        assert_eq!(form.get("code").unwrap(), "one-use-code");
+        assert_eq!(form.get("redirect_uri").unwrap(), &redirect);
+        assert_eq!(
+            requests[1],
+            ("/info".into(), String::new(), "Bearer new-access".into())
+        );
+        assert_eq!(account.uuid, "ely:ffc8fdc95824509e8a57c99b940fb996");
+        let public = serde_json::to_string(&account).unwrap();
+        assert!(!public.contains("new-access") && !public.contains("refresh-token"));
+    }
+
+    fn config() -> Config {
+        Config {
+            client_id: "test-app".into(),
+            redirect: parse_redirect("http://127.0.0.1:38467/oauth/ely").unwrap(),
+            token_url: String::new(),
+            info_url: String::new(),
+        }
+    }
+
+    fn request(flow: &BrowserFlow, target: &str) -> Callback {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        write!(
+            client,
+            "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            flow.config.redirect.port().unwrap()
+        )
+        .unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        callback(&mut stream, &flow.config.redirect, &flow.state)
+    }
+
+    #[test]
+    fn browser_url_has_session_scope_and_random_state_but_never_the_client_secret() {
+        // Bind an ephemeral port for tests, then register that exact loopback URL in the fixture.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = config();
+        config
+            .redirect
+            .set_port(Some(listener.local_addr().unwrap().port()))
+            .unwrap();
+        let flow = BrowserFlow {
+            config,
+            listener,
+            state: "random-state-for-this-test".into(),
+            verifier: "private-verifier-for-this-flow".into(),
+        };
+        let url = flow.authorization_url(None);
+        assert!(!url.contains("private-verifier-for-this-flow"));
+        let url = Url::parse(&url).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            pairs.get("scope").unwrap(),
+            "account_info offline_access minecraft_server_session"
+        );
+        assert_eq!(pairs.get("state").unwrap(), "random-state-for-this-test");
+        assert_eq!(pairs.get("response_type").unwrap(), "code");
+        assert_eq!(pairs.get("code_challenge_method").unwrap(), "S256");
+        assert_eq!(
+            pairs.get("code_challenge").unwrap(),
+            &challenge(&flow.verifier)
+        );
+        assert!(
+            matches!(request(&flow, "/oauth/ely?iss=https%3A%2F%2Faccount.ely.by&state=random-state-for-this-test&code=auth-code"), Callback::Code(c) if c == "auth-code")
+        );
+        for target in [
+            "/oauth/ely?iss=https%3A%2F%2Faccount.ely.by&state=wrong&code=stolen",
+            "/oauth/ely?state=random-state-for-this-test&code=stolen",
+            "/oauth/ely?iss=https%3A%2F%2Fevil.example&state=random-state-for-this-test&code=stolen",
+            "/oauth/ely?iss=https%3A%2F%2Faccount.ely.by&iss=https%3A%2F%2Faccount.ely.by&state=random-state-for-this-test&code=stolen",
+            "/wrong?state=random-state-for-this-test&code=stolen",
+            "/oauth/ely?iss=https%3A%2F%2Faccount.ely.by&state=random-state-for-this-test&state=wrong&code=stolen",
+            "https://evil.example/oauth/ely?code=stolen",
+        ] {
+            assert!(matches!(request(&flow, target), Callback::Ignore));
+        }
+        assert!(matches!(
+            request(
+                &flow,
+                "/oauth/ely?iss=https%3A%2F%2Faccount.ely.by&state=random-state-for-this-test&error=access_denied"
+            ),
+            Callback::Denied
+        ));
+    }
+
+    #[test]
+    fn browser_callback_rejects_nonlocal_redirects_and_cancel_never_waits_for_a_browser() {
+        for url in [
+            "https://evil.example/oauth/ely",
+            "http://localhost:38467/oauth/ely",
+            "http://0.0.0.0:38467/oauth/ely",
+            "http://127.0.0.1:0/oauth/ely",
+            "http://127.0.0.1:38467/",
+            "http://127.0.0.1:38467/oauth/ely?iss=https%3A%2F%2Faccount.ely.by&state=preset",
+        ] {
+            assert!(parse_redirect(url).is_err(), "accepted {url}");
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let flow = BrowserFlow {
+            config: config(),
+            listener,
+            state: "unused".into(),
+            verifier: "unused".into(),
+        };
+        assert!(flow.wait_code(&|| true, Duration::from_secs(60)).is_err());
+        assert!(flow.wait_code(&|| false, Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn oauth_refresh_retains_refresh_tokens_when_ely_omits_them_and_never_exposes_errors() {
+        let first = tokens(200, &json!({"access_token":"access-1","refresh_token":"refresh-secret","token_type":"Bearer","expires_in":86400}), None).unwrap();
+        let renewed = tokens(
+            200,
+            &json!({"access_token":"access-2","expires_in":86400}),
+            Some(&first),
+        )
+        .unwrap();
+        assert_eq!(renewed.refresh_token, "refresh-secret");
+        assert_eq!(renewed.minecraft_token, "access-2");
+        assert!(renewed.ely_oauth && renewed.ely && !renewed.owns);
+        assert!(!format!("{renewed:?}").contains("secret"));
+        assert!(
+            !tokens(400, &json!({"error_description":"reflected-secret"}), None)
+                .unwrap_err()
+                .contains("reflected-secret")
+        );
+        assert!(tokens(
+            200,
+            &json!({"access_token":"missing-refresh","expires_in":86400}),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn public_refresh_sends_no_application_secret_and_retains_the_refresh_token() {
+        let (config, server) = api(vec![(
+            200,
+            json!({"access_token":"refreshed", "expires_in":86400, "token_type":"Bearer"}),
+        )]);
+        let previous = tokens(
+            200,
+            &json!({"access_token":"old", "refresh_token":"kept-refresh", "expires_in":86400}),
+            None,
+        )
+        .unwrap();
+        let (status, value) = token_request(
+            &config,
+            vec![
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &previous.refresh_token),
+                ("scope", SCOPE),
+            ],
+        )
+        .unwrap();
+        let refreshed = tokens(status, &value, Some(&previous)).unwrap();
+        assert_eq!(refreshed.minecraft_token, "refreshed");
+        assert_eq!(refreshed.refresh_token, "kept-refresh");
+        let requests = server.join().unwrap();
+        let form: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(requests[0].1.as_bytes()).collect();
+        assert_eq!(form.get("client_id").unwrap(), "test-app");
+        assert_eq!(form.get("refresh_token").unwrap(), "kept-refresh");
+        assert!(!form.contains_key("client_secret"));
+    }
+
+    #[test]
+    fn nonpositive_lifetimes_require_renewal_instead_of_extending_local_trust() {
+        for lifetime in [-1, 0] {
+            let before = now();
+            let session = tokens(
+                200,
+                &json!({"access_token":"access", "refresh_token":"refresh", "expires_in":lifetime}),
+                None,
+            )
+            .unwrap();
+            assert!(session.minecraft_expires_at >= before);
+            assert!(session.minecraft_expires_at <= now());
+        }
+        assert!(tokens(
+            200,
+            &json!({"access_token":"access", "refresh_token":"refresh", "expires_in":-10}),
+            None
+        )
+        .is_err());
+    }
+    #[test]
+    fn documented_profiles_allow_short_names_and_errors_do_not_echo_private_bodies() {
+        let (config, worker) = api(vec![(
+            200,
+            json!({"uuid":"ffc8fdc9-5824-509e-8a57-c99b940fb996", "username":"Ab"}),
+        )]);
+        assert_eq!(profile(&config, "private-access").unwrap().name, "Ab");
+        worker.join().unwrap();
+        for (status, body) in [
+            (503, json!({"error":"private-access"})),
+            (200, json!({"uuid":"invalid", "username":"private-access"})),
+        ] {
+            let (config, worker) = api(vec![(status, body); if status == 503 { 4 } else { 1 }]);
+            let error = profile(&config, "private-access").unwrap_err();
+            assert!(!error.contains("private-access"));
+            if status == 503 {
+                assert!(error.contains("HTTP 503"));
+            }
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_callbacks_and_denial_never_produce_a_success_page() {
+        let flow = BrowserFlow::new(config()).unwrap();
+        let host = flow.config.redirect.port().unwrap();
+        let state = flow.state.clone();
+        for query in [
+            format!("state={state}&iss=https://account.ely.by&code=one&code=two"),
+            format!("state={state}&iss=https://account.ely.by&code=one&error=access_denied"),
+            format!("state={state}&iss=https://account.ely.by&code=one#error=ignored"),
+        ] {
+            assert!(matches!(
+                request(&flow, &format!("/oauth/ely?{query}")),
+                Callback::Ignore
+            ));
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        write!(client, "GET /oauth/ely?state={state}&iss=https://account.ely.by&code=one HTTP/1.1\r\nHost: evil.example:{host}\r\n\r\n").unwrap();
+        let (mut socket, _) = listener.accept().unwrap();
+        assert!(matches!(
+            callback(&mut socket, &flow.config.redirect, &state),
+            Callback::Ignore
+        ));
+    }
+
+    #[test]
+    fn browser_success_is_sent_only_after_token_exchange_and_profile_succeed() {
+        for (profile_status, can_save, succeeds) in
+            [(200, true, true), (503, true, false), (200, false, false)]
+        {
+            let mut responses = vec![(
+                200,
+                json!({"access_token":"private-access", "refresh_token":"private-refresh", "expires_in":86400}),
+            )];
+            responses.extend(vec![
+                (
+                    profile_status,
+                    json!({"uuid":"ffc8fdc9-5824-509e-8a57-c99b940fb996", "username":"ElyPlayer"})
+                );
+                if profile_status == 503 { 4 } else { 1 }
+            ]);
+            let (config, worker) = api(responses);
+            let flow = BrowserFlow::new(config).unwrap();
+            let address = flow.listener.local_addr().unwrap();
+            let state = flow.state.clone();
+            let browser = std::thread::spawn(move || {
+                let mut socket = TcpStream::connect(address).unwrap();
+                write!(socket, "GET /oauth/ely?state={state}&iss=https://account.ely.by&code=private-code HTTP/1.1\r\nHost: {address}\r\n\r\n").unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut text = String::new();
+                socket.read_to_string(&mut text).unwrap();
+                text
+            });
+            let result = flow.complete_callback(&|| false, Duration::from_secs(2), |pair| {
+                if can_save {
+                    Ok(pair)
+                } else {
+                    Err("Account could not be saved".into())
+                }
+            });
+            assert_eq!(result.is_ok(), succeeds);
+            let page = browser.join().unwrap();
+            assert_eq!(page.contains("Login successful!"), succeeds);
+            assert!(!page.contains("private-access") && !page.contains("private-code"));
+            worker.join().unwrap();
+        }
+    }
+    #[test]
+    fn a_transient_profile_outage_recovers_without_replaying_token_exchange() {
+        let (config, worker) = api(vec![
+            (
+                200,
+                json!({"access_token":"private-access", "refresh_token":"private-refresh", "expires_in":86400}),
+            ),
+            (503, json!({"error":"unavailable"})),
+            (
+                200,
+                json!({"uuid":"ffc8fdc9-5824-509e-8a57-c99b940fb996", "username":"ElyPlayer"}),
+            ),
+        ]);
+        let flow = BrowserFlow::new(config).unwrap();
+        assert_eq!(
+            flow.exchange_code("one-use-code").unwrap().0.name,
+            "ElyPlayer"
+        );
+        let paths: Vec<String> = worker
+            .join()
+            .unwrap()
+            .into_iter()
+            .map(|request| request.0)
+            .collect();
+        assert_eq!(paths, ["/token", "/info", "/info"]);
+    }
+}

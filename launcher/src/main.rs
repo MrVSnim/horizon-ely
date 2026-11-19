@@ -26,6 +26,7 @@ mod cull;
 mod datapacks_page;
 mod dev_options;
 mod developer_play;
+mod ely_page;
 mod export_page;
 mod frame;
 mod game_tools;

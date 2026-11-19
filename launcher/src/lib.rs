@@ -40,6 +40,7 @@ mod native_cache;
 pub mod native_fit;
 pub mod native_mods;
 pub mod native_status;
+pub mod network;
 pub mod nightly;
 pub mod other_launchers;
 pub mod packs;
