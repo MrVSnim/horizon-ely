@@ -903,7 +903,6 @@ impl Launcher {
                             .on_click(move |_, _, cx| cx.open_url(&url)),
                     )
             }
-            _ if !configured => div().child(tr(account::NOT_CONFIGURED)),
             Some(SignInState::Starting) => div().child(tr(if self.ely.active {
                 "Starting Ely.by sign-in…"
             } else {
@@ -944,7 +943,7 @@ impl Launcher {
             }
             Some(SignInState::Done(Err(e))) => div().text_color(t.danger).child(e.clone()),
             None if self.accounts.accounts.is_empty() => div().child(tr(
-                "Horizon needs a Microsoft account that owns Minecraft: Java Edition, like other launchers. It also plays online servers with your name and skin.",
+                "Sign in with Ely.by to play online with your skin and cape, like in other launchers.",
             )),
             None => div().child(tr("Add another account.")),
         };
@@ -1068,7 +1067,7 @@ impl Launcher {
                     )));
                 }
                 actions = actions.child(
-                    button("sign-in-ely", "Sign in with Ely.by", Kind::Secondary, &t).on_click(
+                    button("sign-in-ely", "Sign in with Ely.by", Kind::Primary, &t).on_click(
                         cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.submit_ely();
                             cx.notify();

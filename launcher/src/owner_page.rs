@@ -52,7 +52,6 @@ impl Launcher {
         let state = match &self.sign_in_state {
             _ if sign_in_preview() => Shown::Code("https://www.microsoft.com/link", "K7Q-4MXR"),
             Some(SignInState::Browser(_)) => Shown::Starting("Complete sign-in in your browser…"),
-            _ if !configured && !self.ely.active => Shown::Error(tr(account::NOT_CONFIGURED)),
             Some(SignInState::Starting) => Shown::Starting(if self.ely.active {
                 "Starting Ely.by sign-in…"
             } else {
