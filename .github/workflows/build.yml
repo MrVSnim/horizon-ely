@@ -37,7 +37,7 @@ jobs:
         run: cargo build --manifest-path launcher/Cargo.toml --release --bin horizon-launcher
 
       - name: Build Horizon Client (Rust Game Engine)
-        run: cargo build --release -p horizon-client --bin horizon-client
+        run: cargo build --release -p horizon-game --bin horizon-client
 
       - name: Package Windows Bundle
         shell: pwsh
@@ -75,7 +75,7 @@ jobs:
         run: cargo build --manifest-path launcher/Cargo.toml --release --bin horizon-launcher
 
       - name: Build Horizon Client
-        run: cargo build --release -p horizon-client --bin horizon-client
+        run: cargo build --release -p horizon-game --bin horizon-client
 
       - name: Package Linux Bundle
         run: |
