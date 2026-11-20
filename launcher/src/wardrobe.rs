@@ -359,9 +359,9 @@ pub struct Saved {
 }
 
 impl Saved {
-    /// `<dir>/<uuid>.json`.
+    /// `<dir>/<uuid>.json`. Colon in namespaced UUIDs (`ely:...`) is sanitized for Windows NTFS.
     pub fn path(dir: &Path, uuid: &str) -> PathBuf {
-        dir.join(format!("{uuid}.json"))
+        dir.join(format!("{}.json", uuid.replace(':', "_")))
     }
 
     pub fn load(dir: &Path, uuid: &str) -> Self {

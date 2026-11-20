@@ -83,7 +83,7 @@ impl Status {
         let state = match secrets {
             None => State::SignInRequired,
             Some(s) if s.sign_in_required => State::SignInRequired,
-            Some(s) if !s.owns => State::OwnershipRequired,
+            Some(s) if !s.owns && !s.ely => State::OwnershipRequired,
             Some(s) if s.minecraft_expires_at <= now() + RENEW_BEFORE => State::NeedsRefresh,
             Some(_) => State::Ready,
         };
@@ -388,6 +388,9 @@ pub(super) fn join_server_with(
     accounts: &Path,
     server_id: &str,
 ) -> Result<(), String> {
+    if account.is_ely() {
+        return Err("Ely.by accounts join servers through Ely.by session server".into());
+    }
     let status = refresh_account(ep, client_id, store, account, accounts, &|_| {});
     if status.state != State::Ready {
         return Err(status.message);
