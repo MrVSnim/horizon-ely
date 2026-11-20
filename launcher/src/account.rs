@@ -2473,6 +2473,7 @@ impl SignIn {
                             &|| thread_cancel.load(Ordering::Relaxed),
                             &|_| {},
                         )?;
+                        accounts.save()?;
                         Ok(account)
                     },
                 )
