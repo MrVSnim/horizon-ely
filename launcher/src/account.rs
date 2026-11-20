@@ -2299,12 +2299,21 @@ pub fn write_session_file(
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(&path).map_err(|e| e.to_string())?;
+    let (skin_url, skin_model) = account
+        .skin
+        .as_ref()
+        .map(|(u, m)| (Some(u.as_str()), Some(m.as_str())))
+        .unwrap_or((None, None));
+    let cape_url = account.cape.as_deref();
     let body = json!({
         "name": account.name,
         "uuid": account.profile_uuid(),
         "access_token": secrets.minecraft_token,
         "user_type": if account.is_ely() { "elyby" } else { "msa" },
         "xuid": secrets.xuid,
+        "skin_url": skin_url,
+        "skin_model": skin_model,
+        "cape_url": cape_url,
     });
     std::io::Write::write_all(&mut file, body.to_string().as_bytes()).map_err(|e| e.to_string())?;
     Ok(path)
@@ -2632,6 +2641,9 @@ fn session_file(game_home: &Path, pass: Launch, env: Vec<(&'static str, String)>
         ..GameSession::default()
     };
     if let Some((account, secrets)) = pass.session {
+        if account.is_ely() {
+            out.env.push(("HORIZON_AUTH_PROVIDER", "elyby".to_string()));
+        }
         match write_launch_session_file(&game_home.join("sessions"), &account, &secrets) {
             Ok(file) => out.file = Some(file),
             Err(e) => out.offline = Some(e),

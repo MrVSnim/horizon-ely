@@ -21,6 +21,7 @@ pub struct AuthSession {
     pub xuid: Option<String>,
     access_token: String,
     pub ely: bool,
+    pub textures: Option<crate::skins::Textures>,
 }
 impl std::fmt::Debug for AuthSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -53,6 +54,7 @@ impl AuthSession {
             xuid: None,
             access_token: access_token.to_owned(),
             ely: false,
+            textures: None,
         }
     }
 
@@ -77,12 +79,20 @@ impl AuthSession {
         if field("user_type").is_some_and(|t| t != "msa" && t != "elyby") {
             return Err("the session uses an unsupported account provider".into());
         }
+        let textures = field("skin_url").map(|skin_url| crate::skins::Textures {
+            skin: Some(skin_url.to_owned()),
+            slim: field("skin_model").is_some_and(|m| m.eq_ignore_ascii_case("slim")),
+            cape: field("cape_url").map(str::to_owned),
+            elytra: None,
+            signed: true,
+        });
         Ok(Self {
             name: name.to_owned(),
             uuid,
             xuid: field("xuid").map(str::to_owned),
             access_token: access_token.to_owned(),
             ely: field("user_type") == Some("elyby"),
+            textures,
         })
     }
     /// Read the session file the launcher wrote and delete it at once. It
@@ -585,6 +595,32 @@ const MINECRAFT_PROFILE: &str = "https://api.minecraftservices.com/minecraft/pro
 /// Single-player and integrated servers often send no `textures` property, or
 /// one without the equipped cape; the client asks the profile endpoint once.
 pub fn own_textures(session: &AuthSession) -> Option<crate::skins::Textures> {
+    if let Some(textures) = &session.textures {
+        return Some(textures.clone());
+    }
+    if session.ely {
+        let url = format!(
+            "https://authserver.ely.by/session/profile/{:032x}",
+            session.uuid
+        );
+        let response = agent().get(&url).call().ok()?;
+        if response.status() != 200 {
+            return None;
+        }
+        let body = response.into_string().ok()?;
+        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+        let prop = v
+            .get("properties")?
+            .as_array()?
+            .iter()
+            .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("textures"))?;
+        let val = prop.get("value")?.as_str()?;
+        return Some(crate::skins::unpack(
+            val,
+            crate::skins::Signature::Signed,
+            crate::skins::texture_uris(),
+        ));
+    }
     let response = agent()
         .get(MINECRAFT_PROFILE)
         .set("Authorization", &format!("Bearer {}", session.access_token))
