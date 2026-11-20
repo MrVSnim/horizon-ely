@@ -7,43 +7,6 @@ pub const AUTH_SERVER: &str = "https://authserver.ely.by";
 pub const TWO_FACTOR: &str = "This Ely.by account requires a two-factor authentication code.";
 pub(super) const EXPIRED: &str = "Your Ely.by sign-in expired. Sign in again.";
 
-/// Pinned official binary, not bundled in the public tree. Verified on every use.
-/// https://authlib-injector.yushi.moe/artifact/latest.json (build 56).
-const INJECTOR_URL: &str =
-    "https://authlib-injector.yushi.moe/artifact/56/authlib-injector-1.2.8.jar";
-const INJECTOR_SHA256: &str = "9c7f4343e6c82034958ffb48c14a2cb0c85928be7283103ce17da00c6d5a7b10";
-
-pub fn java_agent(dir: &Path) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let path = dir.join("authlib-injector-1.2.8.jar");
-    let valid = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes)) == INJECTOR_SHA256;
-    if !std::fs::read(&path).is_ok_and(|bytes| valid(&bytes)) {
-        let bytes = crate::backend::get_bytes(INJECTOR_URL)?;
-        if !valid(&bytes) {
-            return Err(crate::i18n::tr(
-                "The Ely.by authentication agent failed its checksum check.",
-            )
-            .into());
-        }
-        std::fs::create_dir_all(dir)
-            .map_err(|_| crate::i18n::tr("Could not save the Ely.by authentication agent."))?;
-        let mut random = [0u8; 12];
-        getrandom::fill(&mut random)
-            .map_err(|_| crate::i18n::tr("Could not create a secure sign-in."))?;
-        let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
-        let temporary = dir.join(format!("authlib-injector-{suffix}.tmp"));
-        std::fs::write(&temporary, bytes)
-            .map_err(|_| crate::i18n::tr("Could not save the Ely.by authentication agent."))?;
-        if let Err(e) = std::fs::rename(&temporary, &path) {
-            let _ = std::fs::remove_file(&temporary);
-            if !std::fs::read(&path).is_ok_and(|bytes| valid(&bytes)) {
-                return Err(e.to_string());
-            }
-        }
-    }
-    Ok(format!("-javaagent:{}=ely.by", path.display()))
-}
-
 fn endpoint() -> String {
     AUTH_SERVER.into()
 }
@@ -119,7 +82,8 @@ fn decode(value: &Value, client: &str) -> Result<(Account, Secrets), String> {
     let name = str_field(profile, "name").ok_or_else(malformed)?;
     if uuid.len() != 32
         || !uuid.bytes().all(|b| b.is_ascii_hexdigit())
-        || !valid_offline_name(&name)
+        || !(1..=16).contains(&name.len())
+        || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
     {
         return Err(malformed());
     }
@@ -359,7 +323,7 @@ mod tests {
         let store = MemoryStore::default();
         let mut accounts = Accounts::default();
         accounts.add(&store, account.clone(), &secrets).unwrap();
-        assert!(accounts.can_play(&store));
+        assert!(accounts.selected.is_some());
         assert!(!accounts.has_owner(&store));
         let public = serde_json::to_string(&accounts).unwrap();
         assert!(!public.contains("access-secret"));

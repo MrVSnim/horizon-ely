@@ -846,9 +846,17 @@ impl Launcher {
                 Some(
                     div()
                         .child(tr(if plays {
-                            "Microsoft account · plays"
+                            if a.is_ely() {
+                                "Ely.by account · plays"
+                            } else {
+                                "Microsoft account · plays"
+                            }
                         } else {
-                            "Microsoft account"
+                            if a.is_ely() {
+                                "Ely.by account"
+                            } else {
+                                "Microsoft account"
+                            }
                         }))
                         .child(account_status_line(status, progress, &t))
                         .when(!busy, |row| {
@@ -875,12 +883,14 @@ impl Launcher {
         let configured = account::client_id().is_some();
         let busy = matches!(
             self.sign_in_state,
-            Some(SignInState::Starting | SignInState::Code(_) | SignInState::Working(_))
+            Some(
+                SignInState::Starting
+                    | SignInState::Code(_)
+                    | SignInState::Working(_)
+                    | SignInState::Browser(_)
+            )
         );
         let detail = match &self.sign_in_state {
-            _ if !configured => div().child(tr(account::NOT_CONFIGURED)),
-            Some(SignInState::Starting) => div().child(tr("Asking Microsoft…")),
-            Some(SignInState::Working(phase)) => div().child(tr(phase.label())),
             Some(SignInState::Browser(url)) => {
                 let url = url.clone();
                 div()
@@ -893,6 +903,13 @@ impl Launcher {
                             .on_click(move |_, _, cx| cx.open_url(&url)),
                     )
             }
+            _ if !configured => div().child(tr(account::NOT_CONFIGURED)),
+            Some(SignInState::Starting) => div().child(tr(if self.ely.active {
+                "Starting Ely.by sign-in…"
+            } else {
+                "Asking Microsoft…"
+            })),
+            Some(SignInState::Working(phase)) => div().child(tr(phase.label())),
             Some(SignInState::Code(code)) => div()
                 .flex()
                 .flex_col()
@@ -953,8 +970,15 @@ impl Launcher {
                 .child(div().child(said)),
             _ => detail,
         };
-        let action = if !configured {
-            None
+        let action = if let Some(SignInState::Browser(_)) = &self.sign_in_state {
+            Some(
+                button("sign-in-cancel-working", "Cancel", Kind::Ghost, &t)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.cancel_sign_in();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            )
         } else if let Some(SignInState::Code(code)) = &self.sign_in_state {
             let (uri, user_code) = (code.verification_uri.clone(), code.user_code.clone());
             let (private_uri, link_uri) = (uri.clone(), uri.clone());
@@ -1015,22 +1039,43 @@ impl Launcher {
         } else {
             let target = self.sign_in_target.as_ref().map(|a| a.uuid.clone());
             let targeted = target.is_some();
-            // Re-signing one account names it; adding one is Microsoft's own button.
-            let sign_in = if targeted {
-                button("sign-in", "Sign in again", Kind::Secondary, &t)
+            let is_ely_target = self.sign_in_target.as_ref().is_some_and(account::Account::is_ely);
+            let mut actions = div().flex().gap(px(4.));
+            if targeted {
+                let label = if is_ely_target {
+                    "Sign in again with Ely.by"
+                } else {
+                    "Sign in again"
+                };
+                actions = actions.child(
+                    button("sign-in", label, Kind::Secondary, &t).on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            if let Some(uuid) = &target {
+                                this.re_sign_in(uuid);
+                            }
+                            cx.notify();
+                        },
+                    )),
+                );
             } else {
-                microsoft::sign_in_button("sign-in", &t)
-            };
-            let mut actions = div().flex().gap(px(4.)).child(sign_in.on_click(cx.listener(
-                move |this, _: &ClickEvent, _, cx| {
-                    if let Some(uuid) = &target {
-                        this.re_sign_in(uuid);
-                    } else {
-                        this.start_sign_in();
-                    }
-                    cx.notify();
-                },
-            )));
+                if configured {
+                    let sign_in = microsoft::sign_in_button("sign-in", &t);
+                    actions = actions.child(sign_in.on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            this.start_sign_in();
+                            cx.notify();
+                        },
+                    )));
+                }
+                actions = actions.child(
+                    button("sign-in-ely", "Sign in with Ely.by", Kind::Secondary, &t).on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.submit_ely();
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
             if targeted {
                 actions = actions.child(
                     button("sign-in-cancel-target", "Cancel", Kind::Ghost, &t).on_click(

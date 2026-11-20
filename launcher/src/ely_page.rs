@@ -27,6 +27,7 @@ impl Launcher {
         self.sign_in_state = Some(SignInState::Starting);
     }
 
+    #[allow(dead_code)]
     pub(super) fn ely_form(&self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let mut body = div().flex().flex_col().gap(px(8.));

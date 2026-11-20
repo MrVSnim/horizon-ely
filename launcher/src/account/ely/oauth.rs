@@ -147,7 +147,9 @@ pub struct BrowserFlow {
 
 impl BrowserFlow {
     pub fn new(mut config: Config) -> Result<Self, String> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
+        let preferred_port = config.redirect.port().unwrap_or(38467);
+        let listener = TcpListener::bind(("127.0.0.1", preferred_port))
+            .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
             .map_err(|_| crate::i18n::tr("Could not start Ely.by browser sign-in."))?;
         config
             .redirect
@@ -404,8 +406,13 @@ fn callback(stream: &mut TcpStream, redirect: &Url, state: &str) -> Callback {
     {
         return Callback::Ignore;
     }
-    if only("state") != Some(state) || only("iss") != Some("https://account.ely.by") {
+    if only("state") != Some(state) {
         return Callback::Ignore;
+    }
+    if let Some(iss) = only("iss") {
+        if iss != "https://account.ely.by" {
+            return Callback::Ignore;
+        }
     }
     if only("error").is_some() {
         return Callback::Denied;

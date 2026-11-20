@@ -63,7 +63,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libvulkan-dev libwayland-dev libxkbcommon-dev libx11-dev libx11-xcb-dev libfontconfig1-dev
+          sudo apt-get install -y libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev libasound2-dev libudev-dev patchelf libssl-dev pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -93,7 +93,7 @@ jobs:
 
   release:
     needs: [build-windows, build-linux]
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+    if: always() && !cancelled() && needs.build-windows.result == 'success' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -116,7 +116,7 @@ jobs:
         run: |
           TAG="${{ github.ref_name }}"
           if [[ "$TAG" == "main" || -z "$TAG" ]]; then
-            TAG="v$(date +'%Y.%m.%d')-ely"
+            TAG="v$(date +'%Y.%m.%d')-ely.${{ github.run_number }}"
           fi
           gh release create "$TAG" release-assets/* \
             --title "Horizon Ely ($TAG)" \

@@ -625,6 +625,14 @@ fn check_with(
     force: bool,
     progress: &dyn Fn(session::Phase),
 ) -> Check {
+    if secrets.ely {
+        if !force && !secrets.sign_in_required
+            && secrets.minecraft_expires_at > now() + RENEW_BEFORE
+        {
+            return Check::Owns(account.clone(), secrets);
+        }
+        return ely::refresh(account, secrets);
+    }
     if secrets.sign_in_required {
         return Check::NoAnswer(SIGN_IN_AGAIN.into(), secrets);
     }
@@ -2051,6 +2059,13 @@ impl Accounts {
     /// play only once an account that owns the game is back.
     pub fn remove(&mut self, store: &dyn SecretStore, uuid: &str) -> Result<(), String> {
         let _operation = session::lock(store)?;
+        if let Ok(Some(text)) = store.get(uuid) {
+            if let Ok(secrets) = serde_json::from_str::<Secrets>(&text) {
+                if secrets.ely {
+                    let _ = ely::invalidate(&secrets);
+                }
+            }
+        }
         store.delete(uuid)?;
         self.accounts.retain(|a| a.uuid != uuid);
         if self.selected.as_deref() == Some(uuid) {
@@ -2120,12 +2135,12 @@ pub fn take_unsaved() -> Option<String> {
 /// the answer in the keychain. An account that gets no answer (no network) keeps its last one, so
 /// being offline never blocks a player who passed before, while "doesn't own" blocks at once.
 /// The caller saves `accounts` (renewed names and skins).
-pub fn launch(
+fn launch_pass(
     ep: &Endpoints,
     client_id: Option<&str>,
     store: &dyn SecretStore,
     accounts: &mut Accounts,
-) -> Result<Launch, NoOwner> {
+) -> (Launch, bool, Option<String>) {
     let selected = accounts.selected.clone();
     let mut order = accounts.accounts.clone();
     order.sort_by_key(|a| Some(&a.uuid) != selected.as_ref());
@@ -2175,7 +2190,9 @@ pub fn launch(
                 if plays {
                     pass.session = Some((renewed.clone(), secrets.clone()));
                 }
-                pass.owner = Some((renewed, secrets.clone()));
+                if secrets.owns {
+                    pass.owner = Some((renewed, secrets.clone()));
+                }
                 (None, secrets)
             }
             Check::DoesNot(secrets) => (Some(DOES_NOT_OWN.to_string()), secrets),
@@ -2203,12 +2220,20 @@ pub fn launch(
             }
         }
     }
+    (pass, owned, unreadable)
+}
+
+pub fn launch(
+    ep: &Endpoints,
+    client_id: Option<&str>,
+    store: &dyn SecretStore,
+    accounts: &mut Accounts,
+) -> Result<Launch, NoOwner> {
+    let (pass, owned, keyring) = launch_pass(ep, client_id, store, accounts);
     if owned {
         Ok(pass)
     } else {
-        Err(NoOwner {
-            keyring: unreadable,
-        })
+        Err(NoOwner { keyring })
     }
 }
 
@@ -2223,9 +2248,17 @@ pub fn launch_for_game(
     accounts: &mut Accounts,
     offline_without_owner: bool,
 ) -> Result<Launch, NoOwner> {
-    match launch(ep, client_id, store, accounts) {
-        Err(NoOwner { .. }) if offline_without_owner => Ok(Launch::default()),
-        pass => pass,
+    let (pass, owned, keyring) = launch_pass(ep, client_id, store, accounts);
+    if owned {
+        Ok(pass)
+    } else if offline_without_owner {
+        Ok(if pass.session.is_some() {
+            pass
+        } else {
+            Launch::default()
+        })
+    } else {
+        Err(NoOwner { keyring })
     }
 }
 
@@ -2579,7 +2612,9 @@ fn launch_as(
     );
     let pass = accounts
         .play_as(store, who.clone())
-        .and_then(|()| launch(ep, client_id, store, accounts).map_err(|e| e.to_string()));
+        .and_then(|()| {
+            launch_for_game(ep, client_id, store, accounts, true).map_err(|e| e.to_string())
+        });
     (
         accounts.selected,
         accounts.offline_selected,

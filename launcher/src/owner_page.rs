@@ -51,9 +51,13 @@ impl Launcher {
         // The screenshot preview shows a code without asking Microsoft for one.
         let state = match &self.sign_in_state {
             _ if sign_in_preview() => Shown::Code("https://www.microsoft.com/link", "K7Q-4MXR"),
-            _ if !configured => Shown::Error(tr(account::NOT_CONFIGURED)),
-            Some(SignInState::Starting) => Shown::Starting("Asking Microsoft…"),
             Some(SignInState::Browser(_)) => Shown::Starting("Complete sign-in in your browser…"),
+            _ if !configured && !self.ely.active => Shown::Error(tr(account::NOT_CONFIGURED)),
+            Some(SignInState::Starting) => Shown::Starting(if self.ely.active {
+                "Starting Ely.by sign-in…"
+            } else {
+                "Asking Microsoft…"
+            }),
             Some(SignInState::Working(phase)) => Shown::Starting(phase.label()),
             Some(SignInState::Code(code)) => Shown::Code(&code.verification_uri, &code.user_code),
             Some(SignInState::Done(Err(e))) => Shown::Error(e),
