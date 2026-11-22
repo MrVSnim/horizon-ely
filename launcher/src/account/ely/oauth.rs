@@ -888,9 +888,11 @@ mod tests {
         assert!(
             matches!(request(&flow, "/oauth/ely?iss=https%3A%2F%2Faccount.ely.by&state=random-state-for-this-test&code=auth-code"), Callback::Code(c) if c == "auth-code")
         );
+        assert!(
+            matches!(request(&flow, "/oauth/ely?state=random-state-for-this-test&code=auth-code-no-iss"), Callback::Code(c) if c == "auth-code-no-iss")
+        );
         for target in [
             "/oauth/ely?iss=https%3A%2F%2Faccount.ely.by&state=wrong&code=stolen",
-            "/oauth/ely?state=random-state-for-this-test&code=stolen",
             "/oauth/ely?iss=https%3A%2F%2Fevil.example&state=random-state-for-this-test&code=stolen",
             "/oauth/ely?iss=https%3A%2F%2Faccount.ely.by&iss=https%3A%2F%2Faccount.ely.by&state=random-state-for-this-test&code=stolen",
             "/wrong?state=random-state-for-this-test&code=stolen",

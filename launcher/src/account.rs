@@ -2299,21 +2299,14 @@ pub fn write_session_file(
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(&path).map_err(|e| e.to_string())?;
-    let (skin_url, skin_model) = account
-        .skin
-        .as_ref()
-        .map(|(u, m)| (Some(u.as_str()), Some(m.as_str())))
-        .unwrap_or((None, None));
-    let cape_url = account.cape.as_deref();
+    // The unmodified game reads "msa" only. An Ely.by account is told apart by what the launcher
+    // gives the game besides this file: `HORIZON_API_DISCOVERY` ([`ely::discovery_url`]).
     let body = json!({
         "name": account.name,
         "uuid": account.profile_uuid(),
         "access_token": secrets.minecraft_token,
-        "user_type": if account.is_ely() { "elyby" } else { "msa" },
+        "user_type": "msa",
         "xuid": secrets.xuid,
-        "skin_url": skin_url,
-        "skin_model": skin_model,
-        "cape_url": cape_url,
     });
     std::io::Write::write_all(&mut file, body.to_string().as_bytes()).map_err(|e| e.to_string())?;
     Ok(path)
@@ -2642,7 +2635,18 @@ fn session_file(game_home: &Path, pass: Launch, env: Vec<(&'static str, String)>
     };
     if let Some((account, secrets)) = pass.session {
         if account.is_ely() {
-            out.env.push(("HORIZON_AUTH_PROVIDER", "elyby".to_string()));
+            // The game stays the official build; like authlib-injector, the launcher only points
+            // it at Ely.by: its services from a discovery document on loopback, its own skin
+            // from the offline-skin files. Without the document the token must not go to the
+            // game at all, or it would be sent to Mojang's services.
+            match ely::discovery_url() {
+                Ok(url) => out.env.push(("HORIZON_API_DISCOVERY", url)),
+                Err(e) => {
+                    out.offline = Some(e);
+                    return out;
+                }
+            }
+            out.env.extend(ely::skin_env(&account, game_home));
         }
         match write_launch_session_file(&game_home.join("sessions"), &account, &secrets) {
             Ok(file) => out.file = Some(file),

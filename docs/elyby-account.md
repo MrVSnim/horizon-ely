@@ -1,11 +1,12 @@
 # Ely.by accounts
 
-Settings → Account → **Sign in with Ely.by** opens the system browser. The launcher
-uses Authorization Code with **S256 PKCE**, a random state, and an ephemeral
-`http://127.0.0.1:<port>/oauth/ely` callback. It checks the exact callback path,
-state and `iss=https://account.ely.by`, then sends the code and the private verifier
-directly to Ely.by over HTTPS. Codes, verifiers and bearer tokens never follow
-HTTP redirects. No hosted backend or client secret is used.
+Settings → Account → **Sign in with Ely.by** (or the button in the top bar) opens the system
+browser. The launcher uses Authorization Code with **S256 PKCE**, a random state, and a
+`http://127.0.0.1:<port>/oauth/ely` loopback callback (the registered port when it is free, an
+OS-assigned one otherwise). It checks the exact callback path and state, and
+`iss=https://account.ely.by` when Ely.by sends an `iss`, then sends the code and the private
+verifier directly to Ely.by over HTTPS. Codes, verifiers and bearer tokens never follow HTTP
+redirects. No hosted backend or client secret is used.
 
 Credentials and two-factor codes stay on Ely.by. User access/refresh tokens are
 kept by the existing account secret store. Cancelling, timeout and rejected
@@ -19,31 +20,24 @@ callbacks do not add or select an account. Microsoft sign-in is unchanged.
    it into a public client. Create a Desktop registration instead.
 3. In your GitHub repository, open **Settings → Secrets and variables → Actions → Variables**.
    Add `HORIZON_ELY_CLIENT_ID` with that public Desktop ID.
-4. Run the Elyhorizon release workflow. It validates the live registration before
-   building, compiles the public ID into the launcher and tests the installed EXE
-   after removing the build environment and using an empty launcher home.
+4. Push to `main`, or run the *Build and Release Elyhorizon* workflow by hand. It compiles the
+   public ID into the launcher and publishes `launcher@<version>-ely.<run>` with the launcher
+   archive the built-in self-update installs from.
 
 Only this public ID is distributed. **Do not set or embed HORIZON_ELY_CLIENT_SECRET**;
 this launcher no longer reads it. No Ely.by secret belongs in Actions Secrets,
 source, installers or release artifacts. Rotate previously disclosed Website
 credentials in Ely.by and use the public Desktop registration for new releases.
 
-Users of a correctly built release simply click Sign in with Ely.by; no developer
-keychain, environment variables or application setup is required on their computer.
+Users of a correctly built release simply click Sign in with Ely.by; no environment variables or
+application setup is required on their computer. For source development,
+`HORIZON_ELY_CLIENT_ID` can be supplied when running Cargo and will be compiled into that build.
+A runtime override takes precedence.
 
-For source development, `HORIZON_ELY_CLIENT_ID` can be supplied when running Cargo
-and will be compiled into that build. A runtime override takes precedence. The
-optional `account ely-configure` command accepts public `client_id` and optional
-loopback `redirect_uri` on stdin, refuses `client_secret`, and is not part of the
-normal installed-user flow. Its port is replaced by an OS-assigned free port.
-A legacy local application record is not needed by a configured release.
-
-`horizon-launcher --json account ely-status` prints only the effective and bundled
-public ID, PKCE method and flow. A missing ID reports a release configuration error;
-`invalid_client` reports that the maintainer must use a public Desktop registration,
-rather than asking the player for a secret. Provider error descriptions are never
-reflected into diagnostics. A refresh failure preserves the existing selected
-account; an invalid/expired grant asks the player to sign in again.
+A missing ID reports a release configuration error; `invalid_client` reports that the
+maintainer must use a public Desktop registration, rather than asking the player for a secret.
+Provider error descriptions are never shown. A refresh failure keeps the selected account; an
+invalid or expired grant asks the player to sign in again.
 
 ## Provider support and verification
 
@@ -59,80 +53,61 @@ not as copied implementation code:
 - [accounts-frontend at 7ab69d0c](https://github.com/elyby/accounts-frontend/tree/7ab69d0c7d258538f8560df7ad209fe8becd0620): forwarding authorization parameters, including PKCE, through browser validation/completion.
 - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636): S256 algorithm and independent test vector.
 
-`python tools/check_ely_oauth.py` checks discovery, rejects a registration that does
-not require PKCE, verifies S256/loopback authorization validation, checks that `plain`
-is rejected, and submits an intentionally invalid code to check secret-free client
-authentication. It never requests or receives a real user token. This preflight is
-**not an interactive end-to-end sign-in test**. Before calling a release verified,
-install its actual setup EXE on clean Windows, complete browser consent, check the
-selected profile, restart the launcher and verify refresh. The maintainer must
-perform that check with their registered Desktop ID and a real test account.
+Before calling a release verified, install it on a clean Windows PC, complete the browser
+consent, check the selected profile, restart the launcher, press Play, and check the skin in
+single-player and on an Ely.by-enabled server. The release workflow also runs the account tests
+(`cargo test --release --manifest-path launcher/Cargo.toml --lib 'account::'`) and reports the
+result without blocking the release; they do not replace that check.
 
-### Local verification on 2026-11-07
+## How the game uses an Ely.by account
 
-With public Desktop ID `elyherizondesktop`, the live preflight passed. A locally
-compiled installer containing the rebuilt launcher and Horizon client was installed
-under an isolated test application ID and fresh data homes. With all runtime
-`HORIZON_ELY_*` variables removed, the installed EXE reported the embedded public
-ID, completed real browser sign-in and the loopback callback, selected the profile,
-and refreshed it from a separate process to `Ready for online play`. Both installed
-program hashes matched the staged files. Uninstallation preserved the isolated
-profile and player-data marker.
+This fork ships no game client of its own: the game is the official, signed Horizon build. As
+authlib-injector does for Java, the launcher only points that game at Ely.by when an Ely.by
+account plays:
 
-This used a local development launcher build and an optimized `fast` game build,
-not a GitHub-produced release or a pristine Windows VM. The same checks are wired
-into the release workflow, but its actual artifact still needs the clean-Windows
-interactive verification above. No backend deployment is required.
+- `HORIZON_API_DISCOVERY` names a services discovery document that the launcher serves on a
+  loopback port (`ely::discovery_url`). The game takes its session endpoints from it (join,
+  hasJoined, profile lookup) and the hosts it may fetch skins from. The document has no `player`
+  service, so the game's account-status and social calls find nothing to ask. The variable is
+  described in [microsoft-account.md](microsoft-account.md).
+- The session file says `user_type: "msa"`, the only value the official game accepts. What sends
+  its requests to Ely.by is the discovery document, not the session file.
+- `HORIZON_OFFLINE_SKIN`, `HORIZON_OFFLINE_SKIN_MODEL` and `HORIZON_OFFLINE_CAPE` carry the Ely.by
+  skin and cape, downloaded from Ely.by's own hosts only, for single-player, where neither a
+  server nor the account supplies one. Other players' skins come from the server as usual.
+- A LAN or Play with Friends world verifies its guests through the same document.
 
-## Automatic installation and file sources
+The launcher has to be running until the game has read the document, which it does once, at its
+first need. If the launcher cannot start the loopback server, the account plays offline: the
+session is not handed over, so the token never reaches Mojang's services.
 
-A freshly authenticated Ely.by account can install missing Minecraft files,
-libraries, assets and Java through the existing downloader. Cached files are
-checked against their published size and SHA-1; incomplete downloads resume.
-The offline developer option and an unverified cached session do not authorize
-a download. Microsoft accounts still use the existing ownership check.
+What the official game does not let the launcher change: its own-profile lookup and Realms use
+fixed Mojang hosts instead of the discovery document and are sent the Ely.by token there. Both
+just fail. Skipping them while `HORIZON_API_DISCOVERY` is set would be a small change in the game
+itself. Ely.by issues no Mojang secure-chat certificates. All accounts of one game start follow
+the playing account's provider, so splitscreen with mixed providers is not supported.
 
-Ely.by handles identity and textures. Minecraft files come from the official
-URLs in the version manifest; Java comes from the configured official runtime
-sources. The publicly documented Ely API does not expose a complete Minecraft
-distribution mirror. The launcher does not label Mojang downloads as Ely.by
-downloads or invent replacement CDN endpoints.
+An Ely.by account is never an owner of Minecraft: Java Edition, so it does not unlock downloads of
+Mojang's files (`account::launch` stays strict for them). Those files come from the player's own
+installation, as the README says; Ely.by supplies identity and textures only.
 
-Java instances automatically use authlib-injector 1.2.8, official build 56. It
-is downloaded into the launcher's data directory, verified against its pinned
-SHA-256 on every use, and activated only for Ely sessions.
+## Accounts and servers
 
-For Horizon, distribute the updated `horizon-client.exe` beside
-`horizon-launcher.exe`. The launcher selects this bundled client when the
-installed version's Minecraft version and client/server hashes match its pins.
-Imported and native-mod builds retain their own executable. An upstream client
-without Ely support cannot read an Ely session. Updated Horizon refuses a bad
-session handoff instead of silently starting with a generated offline name.
+The account switcher supports Microsoft and Ely.by together. `accounts.json` uses
+`ely:<undashed UUID>` for an Ely.by account's launcher identity; the game receives the real
+UUID. The `owner` flag keeps meaning Microsoft ownership, not an Ely.by sign-in. The existing
+`account select`, `refresh`, `session` and `sign-out` commands accept the namespaced account ID.
+Old Ely.by Yggdrasil sessions remain refreshable; signing in again uses the browser OAuth flow.
 
-To build and publish the Windows launcher and matching client from your fork,
-use the [Elyhorizon GitHub Actions release workflow](elyhorizon-releases.md).
+Sign out removes local credentials even while offline. Ely.by does not document OAuth token
+revocation; revoke the app in your Ely.by account's applications page to end its remote access.
 
-## Accounts, servers and CLI
-
-The account switcher supports Microsoft and Ely.by together. `accounts.json`
-uses `ely:<undashed UUID>` for an Ely launcher's identity; games receive the real
-UUID. The `owner` flag continues to mean Microsoft ownership, not Ely sign-in.
-Old Ely Yggdrasil sessions remain refreshable; re-signing uses browser OAuth.
-
-`horizon-launcher account ely-sign-in` prints the authorization URL and waits
-for the browser. Existing `account select`, `refresh`, `session` and `sign-out`
-commands accept the namespaced account ID. CLI/MCP account lists expose only
-public provider, UUID and authentication status, never tokens.
-
-Sign out removes local credentials even while offline. Ely does not document
-OAuth token revocation; revoke the app in your Ely account's applications page
-to end its remote access. Legacy Yggdrasil sessions use `/auth/invalidate`.
-
-Ely accounts join servers configured for Ely.by, rather than Microsoft-only
-online servers. For a Horizon server set `HORIZON_AUTH_PROVIDER=elyby`, keep
-`online-mode=true`, and set `enforce-secure-profile=false`: Ely does not issue
-Mojang secure-chat certificates. Authentication never falls back between
-identity providers.
+Ely.by accounts join servers that verify players with Ely.by, not Microsoft-only online servers.
+A Horizon server reads the same `HORIZON_API_DISCOVERY` (see
+[microsoft-account.md](microsoft-account.md)): point it at a document like the launcher's
+(`discovery_doc` in `launcher/src/account/ely.rs`), keep `online-mode=true` and set
+`enforce-secure-profile=false`, since Ely.by does not issue Mojang secure-chat certificates.
+Authentication never falls back between identity providers.
 
 Protocol references (documentation only):
 
@@ -140,23 +115,3 @@ Protocol references (documentation only):
 - https://docs.ely.by/en/minecraft-auth.html
 - https://docs.ely.by/en/skins-system.html
 - https://docs.ely.by/en/authlib-injector.html
-
-## Diagnostics and clean-install checks
-
-See [the 0.2.2 stabilization report and verification checklist](elyhorizon-0.2.2-verification.md).
-The configured public ID for new builds is `elyhorizondesktop`, supplied through the existing
-Actions Variable `HORIZON_ELY_CLIENT_ID`. On 2026-11-08 the provider rejected that exact ID
-with HTTP 401 `invalid_client`; this is distinct from the older spelling used in the historical
-verification above. No fallback to another application's ID or secret is performed.
-
-A callback now receives **Login successful! Returning to Elyhorizon...** only after token exchange,
-profile validation, expected-account checks and account persistence succeed. The GUI restores its
-existing window once for the completed Ely login. Windows uses `ShowWindowAsync`,
-`SetForegroundWindow` and taskbar attention without input simulation; macOS/Linux use the window
-backend's activation/attention APIs. OS/compositor focus restrictions still apply, especially under
-Wayland. A failed callback, declined login or failed save does not request activation.
-
-The profile parser accepts the documented `uuid` and `username` fields, including existing
-one/two-character Minecraft names. Malformed profiles, HTTP errors, interrupted responses and
-network failures have separate diagnostics. Untrusted response bodies and secret URL parameters
-are never copied into error messages. OAuth token POSTs are not automatically replayed.

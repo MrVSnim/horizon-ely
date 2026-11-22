@@ -11,7 +11,7 @@ on:
         default: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,6 +31,9 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          # The launcher is its own Cargo workspace, so its build output is launcher/target.
+          workspaces: launcher
 
       - name: Determine Version
         id: ver
@@ -49,30 +52,21 @@ jobs:
           HORIZON_LAUNCHER_TAG: ${{ steps.ver.outputs.tag }}
         run: cargo build --manifest-path launcher/Cargo.toml --release --bin horizon-launcher
 
-      - name: Build Horizon Client (Rust Game Engine)
-        run: cargo build --release -p horizon-game --bin horizon-client
+      # Informational: the account tests (they sit next to the code the release depends on) must
+      # not block a release, but a red step here means something broke.
+      - name: Test account code
+        continue-on-error: true
+        run: cargo test --release --manifest-path launcher/Cargo.toml --lib 'account::'
 
       - name: Package Windows Assets
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path dist\bundle -Force | Out-Null
           New-Item -ItemType Directory -Path dist\launcher-only -Force | Out-Null
-          New-Item -ItemType Directory -Path dist\client-only -Force | Out-Null
-
-          Copy-Item launcher\target\release\horizon-launcher.exe dist\bundle\
-          Copy-Item target\release\horizon-client.exe dist\bundle\
-          Copy-Item LICENSE, README.md dist\bundle\ -ErrorAction SilentlyContinue
-
           Copy-Item launcher\target\release\horizon-launcher.exe dist\launcher-only\
-          Copy-Item target\release\horizon-client.exe dist\client-only\
 
-          # 1. Launcher-only zip (used by built-in launcher self-update)
+          # 1. Launcher zip (what the built-in launcher self-update installs from)
           Compress-Archive -Path dist\launcher-only\* -DestinationPath dist\horizon-launcher-windows-x64.zip -Force
-          # 2. Client-only zip
-          Compress-Archive -Path dist\client-only\* -DestinationPath dist\horizon-windows-x64.zip -Force
-          # 3. Full bundle zip (launcher + client together)
-          Compress-Archive -Path dist\bundle\* -DestinationPath dist\horizon-ely-windows-x64.zip -Force
-          # 4. Standalone launcher exe
+          # 2. Standalone launcher exe
           Copy-Item launcher\target\release\horizon-launcher.exe dist\horizon-launcher.exe
 
       - name: Upload Windows Artifacts
@@ -87,6 +81,8 @@ jobs:
     needs: [build-windows]
     if: always() && !cancelled() && needs.build-windows.result == 'success' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release))
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -110,5 +106,5 @@ jobs:
           TAG="launcher@${VERSION}-ely.${{ github.run_number }}"
           gh release create "$TAG" release-assets/* \
             --title "Horizon Ely ($TAG)" \
-            --notes "Automatic build of Horizon Free 0.2.34 with Ely.by skin system and account integration." \
+            --notes "Automatic build of the Horizon launcher with Ely.by sign-in. The game is the official Horizon build, which the launcher installs and starts against Ely.by." \
             --latest

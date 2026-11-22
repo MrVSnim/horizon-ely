@@ -3126,23 +3126,6 @@ pub fn client_command(tag: &str) -> Command {
 /// show Horizon's name and icon (game_app.rs); the bare binary elsewhere, or if that fails.
 pub(crate) fn client_program(tag: &str) -> PathBuf {
     let dir = version_dir(tag);
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let bundled = parent.join(CLIENT);
-            if bundled.is_file() {
-                let target = dir.join(CLIENT);
-                if let Ok(parent_dir) = fs::create_dir_all(&dir) {
-                    let _ = parent_dir;
-                    let target_mtime = fs::metadata(&target).and_then(|m| m.modified()).ok();
-                    let bundled_mtime = fs::metadata(&bundled).and_then(|m| m.modified()).ok();
-                    if !target.exists() || bundled_mtime > target_mtime {
-                        let _ = fs::copy(&bundled, &target);
-                    }
-                }
-                return bundled;
-            }
-        }
-    }
     #[cfg(target_os = "macos")]
     match crate::game_app::ensure(&dir) {
         Ok(program) => return program,

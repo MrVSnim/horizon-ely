@@ -26,15 +26,9 @@ pub struct Textures {
 
 /// The `getTexture` endpoint's valid URIs in production's services discovery
 /// document (`MinecraftServicesEnvironment.PROD`).
-pub const TEXTURE_URIS: [&str; 8] = [
+pub const TEXTURE_URIS: [&str; 2] = [
     "https://textures.minecraft.net/texture/{textureId}",
     "http://textures.minecraft.net/texture/{textureId}",
-    "https://textures.ely.by/",
-    "http://textures.ely.by/",
-    "https://ely.by/storage/",
-    "http://ely.by/storage/",
-    "https://skinsystem.ely.by/",
-    "http://skinsystem.ely.by/",
 ];
 
 /// `MinecraftServicesDiscoveryService`'s valid texture URIs: the discovery
@@ -47,19 +41,11 @@ pub const TEXTURE_URIS: [&str; 8] = [
 pub fn texture_uris() -> &'static [String] {
     static URIS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     URIS.get_or_init(|| {
-        let mut uris: Vec<String> = TEXTURE_URIS.map(str::to_owned).to_vec();
-        if crate::auth::discovery_overridden() {
-            if let Ok(doc) = crate::auth::discovery() {
-                if let Some(doc_uris) = discovery_texture_uris(&doc) {
-                    for u in doc_uris {
-                        if !uris.contains(&u) {
-                            uris.push(u);
-                        }
-                    }
-                }
-            }
-        }
-        uris
+        crate::auth::discovery_overridden()
+            .then(|| crate::auth::discovery().ok())
+            .flatten()
+            .and_then(|doc| discovery_texture_uris(&doc))
+            .unwrap_or_else(|| TEXTURE_URIS.map(str::to_owned).to_vec())
     })
 }
 

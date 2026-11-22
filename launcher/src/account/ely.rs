@@ -240,12 +240,212 @@ pub(super) fn invalidate(secrets: &Secrets) -> Result<(), String> {
     }
 }
 
+/// The services discovery document the unmodified game reads from `HORIZON_API_DISCOVERY`
+/// (docs/microsoft-account.md: "the counterpart of authlib's `-Dminecraft.api.discovery.host`"):
+/// Ely.by's session server and skin hosts where the game would use Mojang's. It has no `player`
+/// service, so the game's account-status and social calls, which read this document, find
+/// nothing to ask.
+fn discovery_doc() -> String {
+    let profile = format!("{AUTH_SERVER}/session/profile/{{profileId}}");
+    serde_json::json!({"discovery": {
+        "session": {"endpoints": {
+            "join": {"uri": format!("{AUTH_SERVER}/session/join")},
+            "verify": {"uri": format!("{AUTH_SERVER}/session/hasJoined")},
+            "getProfileById": {"uri": profile}
+        }},
+        "profiles": {"endpoints": {
+            "getTexture": {"uri": profile, "validUris": [
+                "https://textures.ely.by/",
+                "http://textures.ely.by/",
+                "https://ely.by/storage/",
+                "http://ely.by/storage/",
+                "https://skinsystem.ely.by/",
+                "http://skinsystem.ely.by/",
+                "https://textures.minecraft.net/texture/{textureId}",
+                "http://textures.minecraft.net/texture/{textureId}"
+            ]},
+            "getByName": {"uri": format!("{AUTH_SERVER}/api/users/profiles/minecraft/{{name}}")}
+        }}
+    }})
+    .to_string()
+}
+
+/// The URL of a loopback server for that document, started on first use and kept for this
+/// launcher's run. The game reads the document once, at its first need, so the launcher has to be
+/// alive until then.
+pub fn discovery_url() -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::sync::OnceLock;
+    static URL: OnceLock<Result<String, String>> = OnceLock::new();
+    URL.get_or_init(|| {
+        let unavailable =
+            || crate::i18n::tr("Could not start the Ely.by services for the game.").to_string();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|_| unavailable())?;
+        let port = listener.local_addr().map_err(|_| unavailable())?.port();
+        let body = discovery_doc();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    // The request is not looked at: this server has one document.
+                    let timeout = Some(std::time::Duration::from_secs(2));
+                    let _ = stream.set_read_timeout(timeout);
+                    let _ = stream.set_write_timeout(timeout);
+                    let _ = stream.read(&mut [0u8; 2048]);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                });
+            }
+        });
+        Ok(format!("http://127.0.0.1:{port}/minecraft/client"))
+    })
+    .clone()
+}
+
+/// All of `reader` when it is at most 1 MiB (a skin is far smaller), else None: a skin host, or
+/// whoever sits on the way to an `http://` one, can't make the launcher read without end.
+fn capped(reader: impl std::io::Read) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    reader.take((1 << 20) + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= 1 << 20).then_some(bytes)
+}
+
+/// The Ely.by skin and cape as the game's offline-skin files (`skins::SKIN_ENV` and the other
+/// two). The game asks Mojang's services for its own profile, which an Ely.by token can't use; it
+/// takes these where neither the server nor the account gives the local player a skin, which is
+/// single-player. Only Ely.by's own hosts are fetched ([`texture_url`]); a download that fails
+/// leaves that file out.
+pub fn skin_env(account: &Account, game_home: &Path) -> Vec<(&'static str, String)> {
+    let dir = game_home.join("ely-skins");
+    let fetch = |url: &str, name: &str| -> Option<String> {
+        if !texture_url(url) {
+            return None;
+        }
+        let bytes = capped(crate::backend::get(url).ok()?.into_reader())?;
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).ok()?;
+        Some(path.display().to_string())
+    };
+    let mut env = Vec::new();
+    if let Some((url, model)) = &account.skin {
+        if let Some(path) = fetch(url, "skin.png") {
+            env.push((crate::skins::SKIN_ENV, path));
+            env.push((crate::skins::MODEL_ENV, model.clone()));
+        }
+    }
+    if let Some(path) = account
+        .cape
+        .as_deref()
+        .and_then(|url| fetch(url, "cape.png"))
+    {
+        env.push((crate::skins::CAPE_ENV, path));
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{BufRead, Read, Write};
 
     const UUID: &str = "ffc8fdc95824509e8a57c99b940fb996";
+
+    #[test]
+    fn the_discovery_document_has_what_the_game_reads() {
+        let doc: Value = serde_json::from_str(&discovery_doc()).unwrap();
+        let uri = |pointer: &str| {
+            doc.pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            uri("/discovery/session/endpoints/join/uri").as_deref(),
+            Some("https://authserver.ely.by/session/join")
+        );
+        assert_eq!(
+            uri("/discovery/session/endpoints/verify/uri").as_deref(),
+            Some("https://authserver.ely.by/session/hasJoined")
+        );
+        assert_eq!(
+            uri("/discovery/session/endpoints/getProfileById/uri").as_deref(),
+            Some("https://authserver.ely.by/session/profile/{profileId}")
+        );
+        let valid = doc
+            .pointer("/discovery/profiles/endpoints/getTexture/validUris")
+            .and_then(Value::as_array)
+            .unwrap();
+        for host in [
+            "https://textures.ely.by/",
+            "https://textures.minecraft.net/texture/{textureId}",
+        ] {
+            assert!(valid.iter().any(|u| u == host), "{host}");
+        }
+        // No `player` service: the game's attributes and social calls find nothing to ask.
+        assert!(doc.pointer("/discovery/player").is_none());
+    }
+
+    #[test]
+    fn the_discovery_server_answers_the_game() {
+        let url = discovery_url().unwrap();
+        let (host, path) = url
+            .strip_prefix("http://")
+            .unwrap()
+            .split_once('/')
+            .unwrap();
+        assert!(host.starts_with("127.0.0.1:"));
+        let mut stream = std::net::TcpStream::connect(host).unwrap();
+        write!(
+            stream,
+            "GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(
+            text.split("\r\n\r\n").nth(1),
+            Some(discovery_doc().as_str())
+        );
+        assert_eq!(discovery_url().unwrap(), url, "one server per launcher run");
+    }
+
+    #[test]
+    fn skin_env_fetches_nothing_from_a_foreign_host() {
+        let account = Account {
+            uuid: format!("ely:{UUID}"),
+            name: "Notch".into(),
+            skin: Some(("https://evil.example/skin.png".into(), "classic".into())),
+            cape: Some("http://127.0.0.1:9/cape.png".into()),
+        };
+        assert!(skin_env(&account, &std::env::temp_dir()).is_empty());
+    }
+
+    #[test]
+    fn skin_downloads_are_capped_at_one_mebibyte() {
+        assert_eq!(capped(&b"png"[..]), Some(b"png".to_vec()));
+        assert_eq!(
+            capped(std::io::repeat(7).take(1 << 20)).map(|b| b.len()),
+            Some(1 << 20)
+        );
+        assert_eq!(capped(std::io::repeat(7).take((1 << 20) + 1)), None);
+        assert_eq!(
+            capped(std::io::repeat(7)),
+            None,
+            "an endless body ends at the cap"
+        );
+    }
 
     fn answer(token: &str) -> Value {
         json!({"accessToken": token, "clientToken": "client", "selectedProfile": {"id": UUID, "name": "ElyPlayer"}})
