@@ -44,7 +44,11 @@ impl Launcher {
                 (
                     Player::Microsoft(a.uuid.clone()),
                     a.name.clone(),
-                    tr("Microsoft"),
+                    if a.is_ely() {
+                        tr("Ely.by")
+                    } else {
+                        tr("Microsoft")
+                    },
                 )
             })
             .collect();

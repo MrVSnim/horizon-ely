@@ -1,9 +1,9 @@
 > [!WARNING]
 > This repository is not in any way affiliated with Horizon original devs or Microsoft/Mojang.
 >
-> The goal of this fork is to return local account play with **YOUR** minecraft assets without Microsoft profile authentication
+> The goal of this fork is to return local account play with **YOUR** minecraft assets without Microsoft profile authentication. And support Ely.by
 >
-> You can download it's builds in [RELEASES](https://github.com/0CYBER/horizon-free/releases/latest) section
+> You can download it's builds in [RELEASES](https://github.com/MrVSnim/horizon-ely/releases) section
 >
 > Lower part of the README is fully original
 

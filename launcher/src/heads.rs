@@ -191,6 +191,7 @@ fn profile_face_with(
             .or_else(|| url.strip_prefix("http://textures.minecraft.net/texture/"));
         if texture
             .is_some_and(|hash| !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            || (account.is_ely() && crate::account::ely::texture_url(url))
         {
             let file = cache.join(format!("{:x}.png", Sha1::digest(url.as_bytes())));
             if let Some(face) = std::fs::read(&file)
@@ -209,7 +210,7 @@ fn profile_face_with(
             }
         }
     }
-    default_face(resources, &account.uuid)
+    default_face(resources, account.profile_uuid())
 }
 
 #[cfg(test)]

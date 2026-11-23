@@ -17,7 +17,7 @@ pub const REPO: &str = "horizon-rust/horizon";
 pub fn issues_url() -> String {
     format!("https://github.com/{REPO}/issues")
 }
-pub const LAUNCHER_REPO: &str = "0CYBER/horizon-free";
+pub const LAUNCHER_REPO: &str = "MrVSnim/horizon-ely";
 /// Horizon-free: the game starts without a Microsoft account that owns it, in the window and on
 /// the command line. Downloads still need an owner, so the game comes from the player's own install.
 pub const OFFLINE_PLAY: bool = true;

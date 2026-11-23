@@ -26,6 +26,7 @@ mod cull;
 mod datapacks_page;
 mod dev_options;
 mod developer_play;
+mod ely_page;
 mod export_page;
 mod frame;
 mod game_tools;
@@ -440,6 +441,7 @@ struct Launcher {
     /// developer options (`dev_options`) for this run.
     dev_clicks: u8,
     dev_options: bool,
+    ely: ely_page::ElyUi,
     /// Horizon-free: the name the game made up for an offline player (`horizon-player.txt`), for
     /// the top bar.
     offline_name: Option<String>,

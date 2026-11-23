@@ -648,6 +648,10 @@ impl Launcher {
             horizon_launcher::private_window::detected();
         });
         self.sign_in = Some(match &target {
+            Some(account) if account.is_ely() => {
+                self.ely.active = true;
+                SignIn::start_ely(Some(account.clone()))
+            }
             Some(account) => SignIn::start_for(account.clone()),
             None => SignIn::start(),
         });
@@ -659,6 +663,7 @@ impl Launcher {
         if let Some(old) = self.sign_in.take() {
             old.cancel();
         }
+        self.ely.active = false;
         self.sign_in_state = None;
         self.sign_in_target = None;
     }
