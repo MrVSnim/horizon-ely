@@ -1,0 +1,110 @@
+name: Build and Release Elyhorizon
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish to GitHub Releases'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  HORIZON_TELEMETRY_URL: 'off'
+  # Desktop application ID for Ely.by OAuth (PKCE, public client)
+  HORIZON_ELY_CLIENT_ID: ${{ vars.HORIZON_ELY_CLIENT_ID }}
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The launcher is its own Cargo workspace, so its build output is launcher/target.
+          workspaces: launcher
+
+      - name: Determine Version
+        id: ver
+        shell: pwsh
+        run: |
+          $baseVer = (Get-Content launcher/Cargo.toml | Select-String '^version = "(.*)"').Matches.Groups[1].Value
+          $runVer = "${baseVer}-ely.${{ github.run_number }}"
+          $tag = "launcher@$runVer"
+          Write-Host "Version: $runVer, Tag: $tag"
+          "version=$runVer" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Build Horizon Launcher
+        env:
+          HORIZON_LAUNCHER_VERSION: ${{ steps.ver.outputs.version }}
+          HORIZON_LAUNCHER_TAG: ${{ steps.ver.outputs.tag }}
+        run: cargo build --manifest-path launcher/Cargo.toml --release --bin horizon-launcher
+
+      # Informational: the account tests (they sit next to the code the release depends on) must
+      # not block a release, but a red step here means something broke.
+      - name: Test account code
+        continue-on-error: true
+        run: cargo test --release --manifest-path launcher/Cargo.toml --lib 'account::'
+
+      - name: Package Windows Assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist\launcher-only -Force | Out-Null
+          Copy-Item launcher\target\release\horizon-launcher.exe dist\launcher-only\
+
+          # 1. Launcher zip (what the built-in launcher self-update installs from)
+          Compress-Archive -Path dist\launcher-only\* -DestinationPath dist\horizon-launcher-windows-x64.zip -Force
+          # 2. Standalone launcher exe
+          Copy-Item launcher\target\release\horizon-launcher.exe dist\horizon-launcher.exe
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            dist/*.zip
+            dist/*.exe
+
+  release:
+    needs: [build-windows]
+    if: always() && !cancelled() && needs.build-windows.result == 'success' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Calculate Checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' launcher/Cargo.toml | head -1)
+          TAG="launcher@${VERSION}-ely.${{ github.run_number }}"
+          gh release create "$TAG" release-assets/* \
+            --title "Horizon Ely ($TAG)" \
+            --notes "Automatic build of the Horizon launcher with Ely.by sign-in. The game is the official Horizon build, which the launcher installs and starts against Ely.by." \
+            --latest

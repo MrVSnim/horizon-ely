@@ -328,6 +328,8 @@ fn secrets(token: &str, owns: bool) -> Secrets {
         minecraft_expires_at: now() + 7200,
         xuid: None,
         owns,
+        ely: false,
+        ely_oauth: false,
     }
 }
 
@@ -835,6 +837,8 @@ fn accounts_keep_secrets_in_the_store_only() {
         minecraft_expires_at: 1,
         xuid: None,
         owns: true,
+        ely: false,
+        ely_oauth: false,
     };
     accounts.add(&store, account.clone(), &secrets).unwrap();
     assert_eq!(accounts.selected(), Some(&account));
@@ -1137,6 +1141,8 @@ fn session_files_are_private_and_complete() {
         minecraft_expires_at: 1,
         xuid: Some("25".into()),
         owns: true,
+        ely: false,
+        ely_oauth: false,
     };
     let path = write_session_file(&dir, &account, &secrets).unwrap();
     let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

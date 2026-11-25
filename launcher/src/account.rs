@@ -12,6 +12,7 @@
 //!
 //! The Azure app (client ID) is Horizon's own and is configuration: `HORIZON_MSA_CLIENT_ID` at
 //! build time, or at run time to override it. Without one, sign-in says it is not configured.
+pub mod ely;
 pub mod session;
 
 use serde_json::{json, Value};
@@ -470,14 +471,30 @@ fn owns_game(ep: &Endpoints, token: &str) -> Result<bool, String> {
 /// A Minecraft profile, as the launcher shows and remembers it (no secrets).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Account {
-    /// The profile UUID without dashes.
+    /// The profile UUID without dashes, or `ely:<uuid>`.
     pub uuid: String,
     pub name: String,
-    /// The active skin's URL (textures.minecraft.net) and model ("classic" or "slim").
+    /// The active skin's URL and model ("classic" or "slim").
     #[serde(default)]
     pub skin: Option<(String, String)>,
     #[serde(default)]
     pub cape: Option<String>,
+}
+
+impl Account {
+    pub fn is_ely(&self) -> bool {
+        self.uuid.starts_with("ely:")
+    }
+    pub fn profile_uuid(&self) -> &str {
+        self.uuid.strip_prefix("ely:").unwrap_or(&self.uuid)
+    }
+    pub fn provider_label(&self) -> &'static str {
+        if self.is_ely() {
+            "Ely.by account"
+        } else {
+            "Microsoft account"
+        }
+    }
 }
 
 /// The profile; none when the account has none (it doesn't own the game, or never made one).
@@ -523,18 +540,22 @@ fn profile(ep: &Endpoints, token: &str) -> Result<Option<Account>, String> {
 /// What the keychain keeps for one account.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Secrets {
-    refresh_token: String,
     #[serde(default)]
-    sign_in_required: bool,
-    minecraft_token: String,
-    minecraft_expires_at: u64,
+    pub ely_oauth: bool,
+    pub refresh_token: String,
     #[serde(default)]
-    xuid: Option<String>,
+    pub sign_in_required: bool,
+    pub minecraft_token: String,
+    pub minecraft_expires_at: u64,
+    #[serde(default)]
+    pub xuid: Option<String>,
     /// The last answer the Minecraft services gave: whether the account owns the game. It is
     /// kept here, beside the tokens, so that no plain file can say yes. Accounts saved before it
     /// existed passed the same check at sign-in, which refuses everyone else.
     #[serde(default = "owned_at_sign_in")]
-    owns: bool,
+    pub owns: bool,
+    #[serde(default)]
+    pub ely: bool,
 }
 fn owned_at_sign_in() -> bool {
     true
@@ -568,12 +589,14 @@ pub fn finish_sign_in_with_progress(
 impl Secrets {
     fn new(refresh_token: String, mc: Minecraft) -> Self {
         Self {
+            ely_oauth: false,
             refresh_token,
             sign_in_required: false,
             minecraft_token: mc.token,
             minecraft_expires_at: mc.expires_at,
             xuid: mc.xuid,
             owns: true,
+            ely: false,
         }
     }
 }
@@ -602,6 +625,14 @@ fn check_with(
     force: bool,
     progress: &dyn Fn(session::Phase),
 ) -> Check {
+    if secrets.ely {
+        if !force && !secrets.sign_in_required
+            && secrets.minecraft_expires_at > now() + RENEW_BEFORE
+        {
+            return Check::Owns(account.clone(), secrets);
+        }
+        return ely::refresh(account, secrets);
+    }
     if secrets.sign_in_required {
         return Check::NoAnswer(SIGN_IN_AGAIN.into(), secrets);
     }
@@ -2028,6 +2059,13 @@ impl Accounts {
     /// play only once an account that owns the game is back.
     pub fn remove(&mut self, store: &dyn SecretStore, uuid: &str) -> Result<(), String> {
         let _operation = session::lock(store)?;
+        if let Ok(Some(text)) = store.get(uuid) {
+            if let Ok(secrets) = serde_json::from_str::<Secrets>(&text) {
+                if secrets.ely {
+                    let _ = ely::invalidate(&secrets);
+                }
+            }
+        }
         store.delete(uuid)?;
         self.accounts.retain(|a| a.uuid != uuid);
         if self.selected.as_deref() == Some(uuid) {
@@ -2097,12 +2135,12 @@ pub fn take_unsaved() -> Option<String> {
 /// the answer in the keychain. An account that gets no answer (no network) keeps its last one, so
 /// being offline never blocks a player who passed before, while "doesn't own" blocks at once.
 /// The caller saves `accounts` (renewed names and skins).
-pub fn launch(
+fn launch_pass(
     ep: &Endpoints,
     client_id: Option<&str>,
     store: &dyn SecretStore,
     accounts: &mut Accounts,
-) -> Result<Launch, NoOwner> {
+) -> (Launch, bool, Option<String>) {
     let selected = accounts.selected.clone();
     let mut order = accounts.accounts.clone();
     order.sort_by_key(|a| Some(&a.uuid) != selected.as_ref());
@@ -2152,7 +2190,9 @@ pub fn launch(
                 if plays {
                     pass.session = Some((renewed.clone(), secrets.clone()));
                 }
-                pass.owner = Some((renewed, secrets.clone()));
+                if secrets.owns {
+                    pass.owner = Some((renewed, secrets.clone()));
+                }
                 (None, secrets)
             }
             Check::DoesNot(secrets) => (Some(DOES_NOT_OWN.to_string()), secrets),
@@ -2180,12 +2220,20 @@ pub fn launch(
             }
         }
     }
+    (pass, owned, unreadable)
+}
+
+pub fn launch(
+    ep: &Endpoints,
+    client_id: Option<&str>,
+    store: &dyn SecretStore,
+    accounts: &mut Accounts,
+) -> Result<Launch, NoOwner> {
+    let (pass, owned, keyring) = launch_pass(ep, client_id, store, accounts);
     if owned {
         Ok(pass)
     } else {
-        Err(NoOwner {
-            keyring: unreadable,
-        })
+        Err(NoOwner { keyring })
     }
 }
 
@@ -2200,9 +2248,17 @@ pub fn launch_for_game(
     accounts: &mut Accounts,
     offline_without_owner: bool,
 ) -> Result<Launch, NoOwner> {
-    match launch(ep, client_id, store, accounts) {
-        Err(NoOwner { .. }) if offline_without_owner => Ok(Launch::default()),
-        pass => pass,
+    let (pass, owned, keyring) = launch_pass(ep, client_id, store, accounts);
+    if owned {
+        Ok(pass)
+    } else if offline_without_owner {
+        Ok(if pass.session.is_some() {
+            pass
+        } else {
+            Launch::default()
+        })
+    } else {
+        Err(NoOwner { keyring })
     }
 }
 
@@ -2243,9 +2299,11 @@ pub fn write_session_file(
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(&path).map_err(|e| e.to_string())?;
+    // The unmodified game reads "msa" only. An Ely.by account is told apart by what the launcher
+    // gives the game besides this file: `HORIZON_API_DISCOVERY` ([`ely::discovery_url`]).
     let body = json!({
         "name": account.name,
-        "uuid": account.uuid,
+        "uuid": account.profile_uuid(),
         "access_token": secrets.minecraft_token,
         "user_type": "msa",
         "xuid": secrets.xuid,
@@ -2336,8 +2394,9 @@ fn accept_sign_in(
     }
     if let Some(expected) = expected {
         if expected.uuid != account.uuid {
+            let provider = expected.provider_label();
             return Err(format!(
-                "Signed in as {} instead of {}. Use the Microsoft account for {} and try again.",
+                "Signed in as {} instead of {}. Use the {provider} for {} and try again.",
                 account.name, expected.name, expected.name
             ));
         }
@@ -2360,6 +2419,8 @@ pub enum SignInState {
     Starting,
     /// Waiting for the player at `verification_uri` with `user_code`.
     Code(DeviceCode),
+    /// Ely.by authorization URL; opens in browser.
+    Browser(String),
     Working(session::Phase),
     Done(Result<Account, String>),
 }
@@ -2377,7 +2438,54 @@ impl SignIn {
 
     /// Restore this exact Minecraft identity without changing who currently plays.
     pub fn start_for(account: Account) -> Self {
-        Self::start_expected(Some(account))
+        if account.is_ely() {
+            Self::start_ely(Some(account))
+        } else {
+            Self::start_expected(Some(account))
+        }
+    }
+
+    pub fn start_ely(expected: Option<Account>) -> Self {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_cancel = cancel.clone();
+        let state = Arc::new(Mutex::new(SignInState::Starting));
+        let thread_state = state.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let config = ely::oauth::Config::load()?;
+                let flow = ely::oauth::BrowserFlow::new(config)?;
+                *thread_state.lock().unwrap() =
+                    SignInState::Browser(flow.authorization_url(expected.as_ref()));
+                flow.finish(
+                    &|| thread_cancel.load(Ordering::Relaxed),
+                    |account, secrets| {
+                        let store = store();
+                        let _operation = session::lock(store)?;
+                        let mut accounts = Accounts::load();
+                        accept_sign_in(
+                            &mut accounts,
+                            store,
+                            expected.as_ref(),
+                            account.clone(),
+                            &secrets,
+                            &|| thread_cancel.load(Ordering::Relaxed),
+                            &|_| {},
+                        )?;
+                        accounts.save()?;
+                        Ok(account)
+                    },
+                )
+            })();
+            *thread_state.lock().unwrap() = SignInState::Done(result);
+        });
+        SignIn {
+            state,
+            cancel,
+        }
     }
 
     fn start_expected(expected: Option<Account>) -> Self {
@@ -2507,7 +2615,9 @@ fn launch_as(
     );
     let pass = accounts
         .play_as(store, who.clone())
-        .and_then(|()| launch(ep, client_id, store, accounts).map_err(|e| e.to_string()));
+        .and_then(|()| {
+            launch_for_game(ep, client_id, store, accounts, true).map_err(|e| e.to_string())
+        });
     (
         accounts.selected,
         accounts.offline_selected,
@@ -2524,6 +2634,20 @@ fn session_file(game_home: &Path, pass: Launch, env: Vec<(&'static str, String)>
         ..GameSession::default()
     };
     if let Some((account, secrets)) = pass.session {
+        if account.is_ely() {
+            // The game stays the official build; like authlib-injector, the launcher only points
+            // it at Ely.by: its services from a discovery document on loopback, its own skin
+            // from the offline-skin files. Without the document the token must not go to the
+            // game at all, or it would be sent to Mojang's services.
+            match ely::discovery_url() {
+                Ok(url) => out.env.push(("HORIZON_API_DISCOVERY", url)),
+                Err(e) => {
+                    out.offline = Some(e);
+                    return out;
+                }
+            }
+            out.env.extend(ely::skin_env(&account, game_home));
+        }
         match write_launch_session_file(&game_home.join("sessions"), &account, &secrets) {
             Ok(file) => out.file = Some(file),
             Err(e) => out.offline = Some(e),

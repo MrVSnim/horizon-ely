@@ -317,6 +317,7 @@ impl Launcher {
             backdrop,
             pushed: None,
             scale: window.scale_factor(),
+            ely: ely_page::ElyUi::default(),
         };
         if this.location_error.is_some() || this.location_note.is_some() {
             this.page = Page::Settings;

@@ -581,19 +581,25 @@ impl Launcher {
         changed |= self.toast_tick();
         if let Some(sign_in) = &self.sign_in {
             if let Some(state) = sign_in_change(&mut self.sign_in_state, sign_in.state()) {
-                if let SignInState::Done(Ok(ref account)) = state {
-                    self.auth_busy.remove(&account.uuid);
-                    self.sign_in_target = None;
-                    self.accounts = Accounts::load();
-                    self.load_profile_heads();
-                    self.load_auth_statuses(false);
-                    // Sign-in refuses accounts that don't own the game.
-                    self.owner = Some(true);
-                    self.owner_screen_open = false;
-                    self.client_error = None;
-                    if !self.settings.owner_notice_seen {
-                        self.settings.owner_notice_seen = true;
-                        self.save_settings();
+                if let SignInState::Browser(ref url) = state {
+                    cx.open_url(url);
+                }
+                if let SignInState::Done(ref result) = state {
+                    self.ely.active = false;
+                    if let Ok(ref account) = result {
+                        self.auth_busy.remove(&account.uuid);
+                        self.sign_in_target = None;
+                        self.accounts = Accounts::load();
+                        self.load_profile_heads();
+                        self.load_auth_statuses(false);
+                        // Sign-in refuses accounts that don't own the game.
+                        self.owner = Some(true);
+                        self.owner_screen_open = false;
+                        self.client_error = None;
+                        if !self.settings.owner_notice_seen {
+                            self.settings.owner_notice_seen = true;
+                            self.save_settings();
+                        }
                     }
                 }
                 changed = true;

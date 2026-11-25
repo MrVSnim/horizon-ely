@@ -114,7 +114,7 @@ fn skin(account: &account::Account, resources: &std::path::Path) -> Option<(Arc<
         Some((skin_texture(&png)?, model == "slim"))
     });
     own.or_else(|| {
-        let (file, slim) = horizon_launcher::heads::default_skin_file(resources, &account.uuid)?;
+        let (file, slim) = horizon_launcher::heads::default_skin_file(resources, account.profile_uuid())?;
         Some((skin_texture(&std::fs::read(file).ok()?)?, slim))
     })
 }

@@ -708,18 +708,16 @@ impl Launcher {
             }
         }
 
-        // Horizon-free: the fork's repository, above the Discord button.
-        if backend::OFFLINE_PLAY {
-            foot = foot.child(
-                button(
-                    "horizon-free".into(),
-                    "globe-02",
-                    "Horizon-Free".into(),
-                    false,
-                )
-                .on_click(move |_, _, cx| cx.open_url("https://github.com/0CYBER/horizon-free")),
-            );
-        }
+        // Horizon-Ely: the fork's repository, above the Discord button.
+        foot = foot.child(
+            button(
+                "horizon-ely".into(),
+                "globe-02",
+                "Horizon-Ely".into(),
+                false,
+            )
+            .on_click(move |_, _, cx| cx.open_url("https://github.com/MrVSnim/horizon-ely")),
+        );
         // Discord keeps its own blurple in every theme, as the icon at rest and the fill under the
         // pointer, so it never reads as the selected page. No pulse.
         if !self.links.discord.is_empty() {
@@ -1111,11 +1109,8 @@ impl Launcher {
             .child(keyboard(chip, &t))
             .children(self.glass_account_menu(cx));
 
-        // Signing in with Microsoft, while nobody is: the mockup's button. Horizon-free has no
-        // Microsoft sign-in (offline play is the whole point), so the button stays out.
-        let sign_in = (!backend::OFFLINE_PLAY
-            && !matches!(self.accounts.player(), Player::Microsoft(_)))
-        .then(|| {
+        // Signing in with Ely.by, while nobody is: the mockup's button.
+        let sign_in = (!matches!(self.accounts.player(), Player::Microsoft(_))).then(|| {
             keyboard(
                 div()
                     .id("topbar-sign-in")
@@ -1129,16 +1124,16 @@ impl Launcher {
                     .bg(white(fill::BUTTON))
                     .hover(|s| s.bg(white(fill::BUTTON_HOVER)))
                     .cursor_pointer()
-                    .child(microsoft::logo(16.))
+                    .child(ui::icon("user-add-01", 16., white(ink::FULL)))
                     .when(!tight, |d| {
                         d.child(
                             ui::text(14., FontWeight::MEDIUM, ink::FULL)
-                                .child(tr("Sign in with Microsoft")),
+                                .child(tr("Sign in with Ely.by")),
                         )
                     })
-                    .when(tight, |d| d.tooltip(ui::tip(tr("Sign in with Microsoft"))))
+                    .when(tight, |d| d.tooltip(ui::tip(tr("Sign in with Ely.by"))))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.start_sign_in();
+                        this.submit_ely();
                         cx.notify();
                     })),
                 &t,
